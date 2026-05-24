@@ -138,6 +138,8 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     return 0;
 }
 // dns_build_a_response 构建本地合法响应
+// 返回值： response_len
+// 返回信息（以指针形式）：*outbuf 构造完成的完整合法响应
 int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, uint8_t *outbuf, int outsize) {
     int question_end = find_question_end(query_buf, query_len);
     int pos;
@@ -145,34 +147,41 @@ int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, u
     if (question_end < 0 || outbuf == NULL || outsize < question_end + 16) {
         return -1;
     }
-
+    // 构造响应：
+    // 先原样复制请求中的HEADER和QUESTION部分
     memcpy(outbuf, query_buf, (size_t)question_end);
-
+    // 根据响应性质，覆写flag字段
     // flags: QR=1, OPCODE沿用查询，AA=1，RD沿用查询，RA=0，RCODE=0
     outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
+    // 分别覆写保留字段Z和各个COUNT字段
     outbuf[3] = 0x00;
     write_u16_be(outbuf + 4, 1); // QDCOUNT
     write_u16_be(outbuf + 6, 1); // ANCOUNT
     write_u16_be(outbuf + 8, 0); // NSCOUNT
     write_u16_be(outbuf + 10, 0); // ARCOUNT
-
+    // 在QUESTION结尾追加ANSWER(指Resource Record Format，其中包含NAME TYPE CLASS TTL RDLENGTH RDATA)
     pos = question_end;
     write_u16_be(outbuf + pos, 0xC00C); // NAME 指向请求中的QNAME
+    // 在当前构造方式下可以固定为 0xC00C。因为DNS Header固定12字节，QNAME从偏移量12开始；
+    // 0xC00C中第一个C意为NAME字段为DNS压缩指针而非domain字符串；第二个C意思是“NAME字段指向偏移12处的域名”。
+    // 可以避免重复写入domain，直接去DNS Header中读取
     pos += 2;
     write_u16_be(outbuf + pos, 1); // TYPE A
     pos += 2;
     write_u16_be(outbuf + pos, 1); // CLASS IN
     pos += 2;
-    write_u32_be(outbuf + pos, 60); // TTL
+    write_u32_be(outbuf + pos, 60); // TTL。客户程序保留该资源记录的秒数。
+    // TODO:完善缓存机制
     pos += 4;
-    write_u16_be(outbuf + pos, 4); // RDLENGTH
+    write_u16_be(outbuf + pos, 4); // RDLENGTH。资源数据的字节数，对类型1（TYPE A记录）资源数据是4字节的I P地址
     pos += 2;
     write_u32_be(outbuf + pos, ip); // RDATA IPv4，ip必须已经是网络字节序
     pos += 4;
 
     return pos;
 }
-// dns_build_nxdomain_response 对于本地被拦截的域名构建相应
+// dns_build_nxdomain_response 对于本地被拦截的域名构建NXDOMAIN响应
+// 大体与上面的合法响应相同。区别是因为没有合法响应，所以不需构造ANSWER部分。
 int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t *outbuf, int outsize) {
     int question_end = find_question_end(query_buf, query_len);
 
@@ -185,10 +194,32 @@ int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t
     // flags: QR=1, AA=1，RCODE=3(NXDOMAIN)
     outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
     outbuf[3] = 0x03;
+    // 更新各个COUNT字段
     write_u16_be(outbuf + 4, 1);
-    write_u16_be(outbuf + 6, 0);
+    write_u16_be(outbuf + 6, 0);// 与合法响应不同的是ANCOUNT为0（没有合法回答） 
     write_u16_be(outbuf + 8, 0);
     write_u16_be(outbuf + 10, 0);
 
     return question_end;
+}
+// dns_get_id 从上游响应内容中读取上游id
+uint16_t dns_get_id(const uint8_t *buf, int len) {
+    if (buf == NULL || len < 2) {
+        return 0;
+    }
+    return read_u16_be(buf);
+}
+// dns_set_id 实现修改id
+void dns_set_id(uint8_t *buf, int len, uint16_t id) {
+    if (buf == NULL || len < 2) {
+        return;
+    }
+    write_u16_be(buf, id);
+}
+// dns_is_response 检查传入内容是response还是query
+int dns_is_response(const uint8_t *buf, int len) {
+    if (buf == NULL || len < 4) {
+        return 0;
+    }
+    return (read_u16_be(buf + 2) & 0x8000u) != 0;
 }

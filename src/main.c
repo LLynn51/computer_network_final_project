@@ -1,4 +1,5 @@
 #include "dns.h"
+#include "idmap.h"
 #include "logger.h"
 #include "netutil.h"
 #include "relay.h"
@@ -41,10 +42,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    idmap_init();
     load_table(LOCAL_TABLE_FILE);
 
     // ubp_bind_socket()：将 socket 绑定到命令行输入指定的端口
     // 在 udp_bind_socket.c中实现
+    // 全程（整个项目）只使用一个sock！
     sock = udp_bind_socket(port);
     if (sock == SOCKET_INVALID) {
         net_cleanup();
@@ -55,45 +58,48 @@ int main(int argc, char **argv) {
 
 
     for (;;) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
+        struct sockaddr_in src_addr;
+        socklen_t src_len = sizeof(src_addr);
         int n;
         DNSQuery query;
-        char client_ip[64];
+        char src_ip[64];
         uint32_t local_ip;
         int response_len;
 
 
         printf("waiting...\n");
-        printf("received %d bytes\n", n);
         
-        // recvfrom 等待，直到有client给端口发UDP包
-        // recvfrom函数把DNS数据写进buf，写入发出请求的client，并返回数据长度
-        n = (int)recvfrom(sock, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&client_addr, &client_len);
+        // recvfrom 等待，直到有client或上游DNS给主socket发UDP包
+        // recvfrom函数把DNS数据写进buf，写入发包方地址(src_addr)，并返回数据长度
+        n = (int)recvfrom(sock, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_len);
         if (n <= 0) {
             log_warn("recvfrom failed");
             continue;
         }
+
+        printf("received %d bytes\n", n);
         // 现在buf内已是DNS协议二进制数据
+
+
+        // 处理来自上游DNS服务器的响应
+        if (relay_is_from_upstream(&src_addr) && dns_is_response(buf, n)) {
+            relay_handle_upstream_response(sock, buf, n);
+            continue;
+        }
         
         // dns_parse_query()：进行DNS协议解析
         // 在dns.c中实现
         // 输入buf[]中的原始二进制协议，输出结构化的结果（含有id、domain和qtype等信息）
         if (dns_parse_query(buf, n, &query) != 0) {
             log_warn("invalid dns packet from %s:%u len=%d",
-                     sockaddr_to_string(&client_addr, client_ip, sizeof(client_ip)),
-                     ntohs(client_addr.sin_port),
-                     n);
+                     sockaddr_to_string(&src_addr, src_ip, sizeof(src_ip)),
+                     ntohs(src_addr.sin_port), n);
             continue;
         }
         // 服务器接收到客户端请求时打印调试信息
         log_info("query client=%s:%u id=%u domain=%s qtype=%u qclass=%u",
-                 sockaddr_to_string(&client_addr, client_ip, sizeof(client_ip)),
-                 ntohs(client_addr.sin_port),
-                 query.id,
-                 query.domain,
-                 query.qtype,
-                 query.qclass);
+                 sockaddr_to_string(&src_addr, src_ip, sizeof(src_ip)),
+                 ntohs(src_addr.sin_port), query.id, query.domain, query.qtype, query.qclass);
 
         // 本地表命中时，直接构造固定IP响应
         if (query.qtype == 1 && query.qclass == 1 && table_lookup(query.domain, &local_ip)) {
@@ -104,23 +110,19 @@ int main(int argc, char **argv) {
                 response_len = dns_build_a_response(buf, n, local_ip, response, sizeof(response));
                 log_info("local hit domain=%s", query.domain);
             }
-
+            
+            // 检查是否正常得到 Question 结束后的第一个字节下标
+            // 如果是，转发给发包方（客户端）
             if (response_len > 0) {
-                sendto(sock, (const char *)response, response_len, 0,
-                       (struct sockaddr *)&client_addr, client_len);
+                sendto(sock, (const char *)response, response_len, 0,(struct sockaddr *)&src_addr, src_len);
             } else {
                 log_warn("build local response failed domain=%s", query.domain);
             }
             continue;
         }
 
-        // 第三步：本地未命中时，转发给上游DNS，并把上游响应原样返回客户端
-        response_len = relay_forward_query(buf, n, response, sizeof(response));
-        if (response_len > 0) {
-            sendto(sock, (const char *)response, response_len, 0,
-                   (struct sockaddr *)&client_addr, client_len);
-            log_info("forwarded domain=%s response_len=%d", query.domain, response_len);
-        } else {
+        // 本地未命中时，复用主socket转发给上游DNS；响应会在后续recvfrom中收到
+        if (relay_forward_query(sock, buf, n, &src_addr, src_len, query.domain) != 0) {
             log_warn("forward failed domain=%s", query.domain);
         }
     }
