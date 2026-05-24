@@ -1,11 +1,16 @@
 #include "dns.h"
 #include "logger.h"
 #include "netutil.h"
+#include "relay.h"
+#include "table.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
-#define DEFAULT_DNS_PORT 5353
+// 端口53需要管理员权限
+#define DEFAULT_DNS_PORT 53
+#define LOCAL_TABLE_FILE "data/dnsrelay.txt"
 
 static uint16_t parse_port(int argc, char **argv) {
     long port;
@@ -23,22 +28,31 @@ static uint16_t parse_port(int argc, char **argv) {
     return (uint16_t)port;
 }
 
+// 由于UDP协议不可信，因此每次每次调用协议解析器都需要检查边界
 int main(int argc, char **argv) {
     uint16_t port = parse_port(argc, argv);
     socket_t sock;
     uint8_t buf[DNS_MAX_PACKET_SIZE];
+    uint8_t response[DNS_MAX_PACKET_SIZE];
 
+    // net_init()：Windows系统下WSAStartup()
+    // 在netutil.c中实现
     if (net_init() != 0) {
         return 1;
     }
 
+    load_table(LOCAL_TABLE_FILE);
+
+    // ubp_bind_socket()：将 socket 绑定到命令行输入指定的端口
+    // 在 udp_bind_socket.c中实现
     sock = udp_bind_socket(port);
     if (sock == SOCKET_INVALID) {
         net_cleanup();
         return 1;
     }
-
+    // 绑定成功后打印调试信息
     log_info("DNS relay listening on UDP port %u", port);
+
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -46,14 +60,25 @@ int main(int argc, char **argv) {
         int n;
         DNSQuery query;
         char client_ip[64];
+        uint32_t local_ip;
+        int response_len;
 
-        n = (int)recvfrom(sock, (char *)buf, sizeof(buf), 0,
-                         (struct sockaddr *)&client_addr, &client_len);
+
+        printf("waiting...\n");
+        printf("received %d bytes\n", n);
+        
+        // recvfrom 等待，直到有client给端口发UDP包
+        // recvfrom函数把DNS数据写进buf，写入发出请求的client，并返回数据长度
+        n = (int)recvfrom(sock, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&client_addr, &client_len);
         if (n <= 0) {
             log_warn("recvfrom failed");
             continue;
         }
-
+        // 现在buf内已是DNS协议二进制数据
+        
+        // dns_parse_query()：进行DNS协议解析
+        // 在dns.c中实现
+        // 输入buf[]中的原始二进制协议，输出结构化的结果（含有id、domain和qtype等信息）
         if (dns_parse_query(buf, n, &query) != 0) {
             log_warn("invalid dns packet from %s:%u len=%d",
                      sockaddr_to_string(&client_addr, client_ip, sizeof(client_ip)),
@@ -61,7 +86,7 @@ int main(int argc, char **argv) {
                      n);
             continue;
         }
-
+        // 服务器接收到客户端请求时打印调试信息
         log_info("query client=%s:%u id=%u domain=%s qtype=%u qclass=%u",
                  sockaddr_to_string(&client_addr, client_ip, sizeof(client_ip)),
                  ntohs(client_addr.sin_port),
@@ -69,9 +94,39 @@ int main(int argc, char **argv) {
                  query.domain,
                  query.qtype,
                  query.qclass);
+
+        // 本地表命中时，直接构造固定IP响应
+        if (query.qtype == 1 && query.qclass == 1 && table_lookup(query.domain, &local_ip)) {
+            if (local_ip == 0) { // 如果 *ip==0 ，说明是被拦截的域名；
+                response_len = dns_build_nxdomain_response(buf, n, response, sizeof(response));
+                log_info("local block domain=%s", query.domain);
+            } else { // 否则是正常返回的域名
+                response_len = dns_build_a_response(buf, n, local_ip, response, sizeof(response));
+                log_info("local hit domain=%s", query.domain);
+            }
+
+            if (response_len > 0) {
+                sendto(sock, (const char *)response, response_len, 0,
+                       (struct sockaddr *)&client_addr, client_len);
+            } else {
+                log_warn("build local response failed domain=%s", query.domain);
+            }
+            continue;
+        }
+
+        // 第三步：本地未命中时，转发给上游DNS，并把上游响应原样返回客户端
+        response_len = relay_forward_query(buf, n, response, sizeof(response));
+        if (response_len > 0) {
+            sendto(sock, (const char *)response, response_len, 0,
+                   (struct sockaddr *)&client_addr, client_len);
+            log_info("forwarded domain=%s response_len=%d", query.domain, response_len);
+        } else {
+            log_warn("forward failed domain=%s", query.domain);
+        }
     }
 
     socket_close(sock);
+    table_free();
     net_cleanup();
     return 0;
 }
