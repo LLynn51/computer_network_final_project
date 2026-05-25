@@ -1,7 +1,10 @@
 // dns.c 负责将recvfrom()收到的DNS二进制报文解析成程序内部容易使用的DNSQuery结构体
 #include "dns.h"
 
+#include "netutil.h"
+
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 // uint16_t 从网络（大端序）读取一个16位无符号整数
@@ -73,6 +76,43 @@ static int skip_dns_name(const uint8_t *buf, int len, int pos) {
     }
 
     return -1;
+}
+
+static int write_qname(const char *domain, uint8_t *outbuf, int outsize, int pos) {
+    const char *label_start = domain;
+    const char *p = domain;
+
+    if (domain == NULL || outbuf == NULL || pos < 0) {
+        return -1;
+    }
+
+    while (1) {
+        if (*p == '.' || *p == '\0') {
+            int label_len = (int)(p - label_start);
+
+            if (label_len <= 0 || label_len > 63 || pos + 1 + label_len >= outsize) {
+                return -1;
+            }
+
+            outbuf[pos++] = (uint8_t)label_len;
+            memcpy(outbuf + pos, label_start, (size_t)label_len);
+            pos += label_len;
+
+            if (*p == '\0') {
+                break;
+            }
+
+            label_start = p + 1;
+        }
+
+        p++;
+    }
+
+    if (pos >= outsize) {
+        return -1;
+    }
+    outbuf[pos++] = 0;
+    return pos;
 }
 
 // dns_parse_query 解析DNS报文
@@ -161,6 +201,38 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     query->qclass = read_u16_be(buf + pos + 2); // 一般 IN （1） 表示 Internet
     // 解析成功，返回0
     return 0;
+}
+
+int dns_build_query(const char *domain, uint16_t qtype, uint8_t *outbuf, int outsize, uint16_t *out_id) {
+    int pos = DNS_HEADER_SIZE;
+    uint16_t id;
+
+    if (domain == NULL || domain[0] == '\0' || outbuf == NULL || out_id == NULL || outsize < DNS_HEADER_SIZE + 5) {
+        return -1;
+    }
+
+    memset(outbuf, 0, (size_t)outsize);
+    id = (uint16_t)(net_now_ms() ^ (uint64_t)rand());
+    *out_id = id;
+
+    write_u16_be(outbuf, id);
+    write_u16_be(outbuf + 2, 0x0100); // RD=1，普通递归查询
+    write_u16_be(outbuf + 4, 1); // QDCOUNT
+    write_u16_be(outbuf + 6, 0);
+    write_u16_be(outbuf + 8, 0);
+    write_u16_be(outbuf + 10, 0);
+
+    pos = write_qname(domain, outbuf, outsize, pos);
+    if (pos < 0 || pos + 4 > outsize) {
+        return -1;
+    }
+
+    write_u16_be(outbuf + pos, qtype);
+    pos += 2;
+    write_u16_be(outbuf + pos, 1); // QCLASS IN
+    pos += 2;
+
+    return pos;
 }
 // dns_build_a_response 构建本地合法响应
 // 返回值： response_len
@@ -313,5 +385,26 @@ int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32
         pos += rdlength;
     }
 
+    return 0;
+}
+
+int dns_parse_response(const uint8_t *buf, int len, DNSResponse *response) {
+    uint16_t flags;
+
+    if (buf == NULL || response == NULL || len < DNS_HEADER_SIZE) {
+        return -1;
+    }
+
+    memset(response, 0, sizeof(*response));
+    response->id = read_u16_be(buf);
+    flags = read_u16_be(buf + 2);
+
+    if ((flags & 0x8000u) == 0) {
+        return -1;
+    }
+
+    response->rcode = (uint16_t)(flags & 0x000fu);
+    response->answer_count = read_u16_be(buf + 6);
+    response->has_a_record = dns_extract_first_a_record(buf, len, &response->ipv4, &response->ttl_sec);
     return 0;
 }
