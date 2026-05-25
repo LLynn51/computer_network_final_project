@@ -1,12 +1,13 @@
 #include "relay.h"
 
+#include "cache.h"
+#include "config.h"
 #include "dns.h"
 #include "idmap.h"
 #include "logger.h"
 
 #include <string.h>
 
-#define UPSTREAM_DNS_IP "8.8.8.8" // 默认上游DNS服务器ip
 #define UPSTREAM_DNS_PORT 53
 
 // 没看懂
@@ -17,7 +18,7 @@ void relay_get_upstream_addr(struct sockaddr_in *addr) {
     memset(addr, 0, sizeof(*addr));
     addr->sin_family = AF_INET;
     addr->sin_port = htons(UPSTREAM_DNS_PORT);
-    addr->sin_addr.s_addr = inet_addr(UPSTREAM_DNS_IP);
+    addr->sin_addr.s_addr = inet_addr(config_get()->upstream_dns);
 }
 // 没看懂
 int relay_is_from_upstream(const struct sockaddr_in *addr) {
@@ -80,6 +81,9 @@ int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int res
     uint16_t client_id;
     struct sockaddr_in client_addr;
     socklen_t client_len;
+    char domain[256];
+    uint32_t cache_ip;
+    uint32_t ttl_sec;
     int n;
 
     if (sock == SOCKET_INVALID || response_buf == NULL || response_len <= 0) {
@@ -87,9 +91,12 @@ int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int res
     }
     // 获取上游 DNS 服务器 id
     upstream_id = dns_get_id(response_buf, response_len);
-    if (!idmap_find(upstream_id, &client_id, &client_addr, &client_len)) {
+    if (!idmap_find(upstream_id, &client_id, &client_addr, &client_len, domain, sizeof(domain))) {
         log_warn("unknown upstream response id=%u", upstream_id);
         return -1;
+    }
+    if (dns_extract_first_a_record(response_buf, response_len, &cache_ip, &ttl_sec)) {
+        cache_store(domain, cache_ip, ttl_sec);
     }
     // 将上游DNS服务器响应的id设置为客户端请求的旧id
     dns_set_id(response_buf, response_len, client_id);

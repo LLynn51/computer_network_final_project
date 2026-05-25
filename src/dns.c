@@ -50,6 +50,31 @@ static int find_question_end(const uint8_t *buf, int len) {
     return -1;
 }
 
+static int skip_dns_name(const uint8_t *buf, int len, int pos) {
+    while (pos < len) {
+        uint8_t label_len = buf[pos++];
+
+        if (label_len == 0) {
+            return pos;
+        }
+
+        if ((label_len & 0xC0u) == 0xC0u) {
+            if (pos < len) {
+                return pos + 1;
+            }
+            return -1;
+        }
+
+        if ((label_len & 0xC0u) != 0 || label_len > 63 || pos + label_len > len) {
+            return -1;
+        }
+
+        pos += label_len;
+    }
+
+    return -1;
+}
+
 // dns_parse_query 解析DNS报文
 // 参数： buf recv_from()收到的报文原始数据
 // len buf总长度，来自recvfrom返回值。因为网络数据不可信，所以需要时时检查以防越界。
@@ -222,4 +247,71 @@ int dns_is_response(const uint8_t *buf, int len) {
         return 0;
     }
     return (read_u16_be(buf + 2) & 0x8000u) != 0;
+}
+
+int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32_t *ttl_sec) {
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    int pos;
+    int i;
+
+    if (buf == NULL || ip == NULL || ttl_sec == NULL || len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+
+    flags = read_u16_be(buf + 2);
+    qdcount = read_u16_be(buf + 4);
+    ancount = read_u16_be(buf + 6);
+
+    if ((flags & 0x8000u) == 0 || (flags & 0x000fu) != 0 || qdcount == 0 || ancount == 0) {
+        return 0;
+    }
+
+    pos = DNS_HEADER_SIZE;
+    for (i = 0; i < qdcount; i++) {
+        pos = skip_dns_name(buf, len, pos);
+        if (pos < 0 || pos + 4 > len) {
+            return 0;
+        }
+        pos += 4;
+    }
+
+    for (i = 0; i < ancount; i++) {
+        uint16_t type;
+        uint16_t class_value;
+        uint16_t rdlength;
+        uint32_t ttl;
+
+        pos = skip_dns_name(buf, len, pos);
+        if (pos < 0 || pos + 10 > len) {
+            return 0;
+        }
+
+        type = read_u16_be(buf + pos);
+        class_value = read_u16_be(buf + pos + 2);
+        ttl = ((uint32_t)buf[pos + 4] << 24) |
+              ((uint32_t)buf[pos + 5] << 16) |
+              ((uint32_t)buf[pos + 6] << 8) |
+              (uint32_t)buf[pos + 7];
+        rdlength = read_u16_be(buf + pos + 8);
+        pos += 10;
+
+        if (pos + rdlength > len) {
+            return 0;
+        }
+
+        if (type == 1 && class_value == 1 && rdlength == 4) {
+            *ip = ((uint32_t)buf[pos] << 24) |
+                  ((uint32_t)buf[pos + 1] << 16) |
+                  ((uint32_t)buf[pos + 2] << 8) |
+                  (uint32_t)buf[pos + 3];
+            *ttl_sec = ttl;
+            return 1;
+        }
+
+        pos += rdlength;
+    }
+
+    return 0;
 }

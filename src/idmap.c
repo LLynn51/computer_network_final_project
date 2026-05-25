@@ -97,7 +97,12 @@ int idmap_add(uint16_t client_id,const struct sockaddr_in *client_addr,
     return -1;
 }
 // idmap_find 寻找和上游DNS响应id对应的客户端请求id
-int idmap_find(uint16_t upstream_id, uint16_t *client_id, struct sockaddr_in *client_addr,socklen_t *client_len) {
+int idmap_find(uint16_t upstream_id,
+               uint16_t *client_id,
+               struct sockaddr_in *client_addr,
+               socklen_t *client_len,
+               char *domain,
+               int domain_size) {
     int i;
     // 遍历 idmap 中所有条目，寻找对应 id。 如果成功找到，就返回条目中存储的信息。
     for (i = 0; i < IDMAP_MAX_ENTRIES; i++) {
@@ -110,6 +115,10 @@ int idmap_find(uint16_t upstream_id, uint16_t *client_id, struct sockaddr_in *cl
             }
             if (client_len != NULL) {
                 *client_len = g_entries[i].client_len;
+            }
+            if (domain != NULL && domain_size > 0) {
+                strncpy(domain, g_entries[i].domain, (size_t)domain_size - 1);
+                domain[domain_size - 1] = '\0';
             }
             return 1;
         }

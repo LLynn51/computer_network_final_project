@@ -20,5 +20,6 @@ int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t
 uint16_t dns_get_id(const uint8_t *buf, int len);
 void dns_set_id(uint8_t *buf, int len, uint16_t id);
 int dns_is_response(const uint8_t *buf, int len);
+int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32_t *ttl_sec);
 
 #endif
