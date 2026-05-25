@@ -6,6 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 // net_init Windows系统下需要初始化
 int net_init(void) {
 #ifdef _WIN32
@@ -63,16 +69,56 @@ socket_t udp_bind_socket(uint16_t port) {
 }
 
 const char *sockaddr_to_string(const struct sockaddr_in *addr, char *buf, int buflen) {
-    const char *ip = NULL;
-
     if (addr == NULL || buf == NULL || buflen <= 0) {
         return "";
     }
 
-    ip = inet_ntop(AF_INET, &addr->sin_addr, buf, (socklen_t)buflen);
-    if (ip == NULL) {
-        snprintf(buf, (size_t)buflen, "<invalid>");
-    }
+    snprintf(buf, (size_t)buflen, "%s", inet_ntoa(addr->sin_addr));
 
     return buf;
+}
+
+// net_wait_readable 使用select等待socket可读。
+// 返回值：1 表示可读；0 表示超时；-1 表示select失败。
+int net_wait_readable(socket_t sock, int timeout_ms) {
+    fd_set readfds;
+    struct timeval timeout;
+    int ret;
+
+    if (sock == SOCKET_INVALID || timeout_ms < 0) {
+        return -1;
+    }
+
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+
+#ifdef _WIN32
+    // 使用select() 判断socket是否可读
+    ret = select(0, &readfds, NULL, NULL, &timeout);
+#else
+    ret = select(sock + 1, &readfds, NULL, NULL, &timeout);
+#endif
+    if (ret > 0 && FD_ISSET(sock, &readfds)) {
+        return 1;
+    }
+
+    if (ret == 0) {
+        return 0;
+    }
+
+    return -1;
+}
+
+// net_now_ms 返回单调递增的毫秒时间，用于计算上游DNS请求是否超时。
+uint64_t net_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
 }

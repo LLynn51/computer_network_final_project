@@ -16,5 +16,6 @@ int idmap_find(uint16_t upstream_id,
                struct sockaddr_in *client_addr,
                socklen_t *client_len);
 void idmap_remove(uint16_t upstream_id);
+void idmap_cleanup_timeout(uint64_t now_ms, uint64_t timeout_ms);
 
 #endif

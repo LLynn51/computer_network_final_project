@@ -15,6 +15,7 @@ typedef struct {
     struct sockaddr_in client_addr;
     socklen_t client_len;
     char domain[256];
+    uint64_t created_at_ms; // 创建时间戳
 } IDMapEntry; // 单条映射条目
 static IDMapEntry g_entries[IDMAP_MAX_ENTRIES]; // g_entries 存储所有ID映射
 static uint16_t g_next_id = 1; // g_next_id 新分配id的计数器
@@ -78,6 +79,7 @@ int idmap_add(uint16_t client_id,const struct sockaddr_in *client_addr,
             g_entries[i].client_id = client_id;
             g_entries[i].client_addr = *client_addr;
             g_entries[i].client_len = client_len;
+            g_entries[i].created_at_ms = net_now_ms();
             // 填入domain字段时注意结束符和为空处理
             if (domain != NULL) {
                 strncpy(g_entries[i].domain, domain, sizeof(g_entries[i].domain) - 1);
@@ -116,7 +118,7 @@ int idmap_find(uint16_t upstream_id, uint16_t *client_id, struct sockaddr_in *cl
     return 0;
 }
 
-// idmap_remove 清除ID映射表中特定的条目
+// idmap_remove 清除ID映射表中特定的条目（转发失败和已经完成的包）
 void idmap_remove(uint16_t upstream_id) {
     int i;
     for (i = 0; i < IDMAP_MAX_ENTRIES; i++) {
@@ -124,6 +126,24 @@ void idmap_remove(uint16_t upstream_id) {
             // 清除方式：直接设为0
             memset(&g_entries[i], 0, sizeof(g_entries[i]));
             return;
+        }
+    }
+}
+
+// idmap_cleanup_timeout 清理超过timeout_ms仍未收到上游DNS响应的映射项
+// 参数 timeout_ms 一般直接传入默认值
+// 每次报错和转发时调用
+void idmap_cleanup_timeout(uint64_t now_ms, uint64_t timeout_ms) {
+    int i;
+    // 遍历ID映射表，对于正在使用且超时的条目进行清理
+    for (i = 0; i < IDMAP_MAX_ENTRIES; i++) {
+        if (g_entries[i].used && now_ms - g_entries[i].created_at_ms >= timeout_ms) {
+            log_warn("upstream timeout domain=%s client_id=%u upstream_id=%u age=%llu ms",
+                     g_entries[i].domain,
+                     g_entries[i].client_id,
+                     g_entries[i].upstream_id,
+                     (unsigned long long)(now_ms - g_entries[i].created_at_ms));
+            memset(&g_entries[i], 0, sizeof(g_entries[i]));
         }
     }
 }

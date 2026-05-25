@@ -22,5 +22,7 @@ int net_init(void);
 void net_cleanup(void);
 socket_t udp_bind_socket(uint16_t port);
 const char *sockaddr_to_string(const struct sockaddr_in *addr, char *buf, int buflen);
+int net_wait_readable(socket_t sock, int timeout_ms);
+uint64_t net_now_ms(void);
 
 #endif
