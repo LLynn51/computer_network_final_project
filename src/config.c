@@ -6,14 +6,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+// 服务端默认监听 DNS UDP 端口。
 #define DEFAULT_DNS_PORT 53
-#define DEFAULT_UPSTREAM_DNS "8.8.8.8"
+
+// 默认上游 DNS 服务器，通常是校园网/实验环境内的递归 DNS。
+#define DEFAULT_UPSTREAM_DNS "10.3.9.4"
+
+// 默认本地域名-IP 映射表路径。
 #define DEFAULT_TABLE_FILE "data/dnsrelay.txt"
+
+// 事件循环 select() 的默认唤醒间隔，单位毫秒。
 #define DEFAULT_EVENT_LOOP_TIMEOUT_MS 1000
+
+// 上游 DNS 请求 ID 映射的默认超时时间，单位毫秒。
 #define DEFAULT_IDMAP_TIMEOUT_MS 5000
 
+// 全局配置实例，启动时由默认值和命令行参数共同填充。
 static Config g_config;
 
+// 安全复制字符串，保证目标缓冲区总是以 '\0' 结尾。
 static void copy_string(char *dst, int dst_size, const char *src) {
     if (dst == NULL || dst_size <= 0) {
         return;
@@ -28,6 +39,7 @@ static void copy_string(char *dst, int dst_size, const char *src) {
     dst[dst_size - 1] = '\0';
 }
 
+// 解析监听端口，端口必须位于 1..65535。
 static int parse_port(const char *s, uint16_t *port) {
     long value;
     char *end = NULL;
@@ -45,6 +57,7 @@ static int parse_port(const char *s, uint16_t *port) {
     return 0;
 }
 
+// 解析正整数毫秒参数，并限制到合理上界避免异常长等待。
 static int parse_positive_int(const char *s, int *value) {
     long parsed;
     char *end = NULL;
@@ -62,6 +75,79 @@ static int parse_positive_int(const char *s, int *value) {
     return 0;
 }
 
+// 检查命令行字符串能完整放入配置缓冲区，避免被静默截断。
+static int string_fits_config_buffer(const char *s, int max_size) {
+    if (s == NULL || max_size <= 0) {
+        return 0;
+    }
+
+    return strlen(s) < (size_t)max_size;
+}
+
+// 校验上游 DNS 是否为可用 IPv4 字面量，排除 0.0.0.0 和 255.255.255.255。
+static int is_valid_ipv4_literal(const char *s) {
+    int part;
+    int all_zero = 1;
+    int all_255 = 1;
+    const char *p = s;
+
+    if (s == NULL || *s == '\0') {
+        return 0;
+    }
+
+    for (part = 0; part < 4; part++) {
+        long octet;
+        char *end = NULL;
+
+        if (*p == '\0') {
+            return 0;
+        }
+
+        octet = strtol(p, &end, 10);
+        if (end == p || octet < 0 || octet > 255) {
+            return 0;
+        }
+        if (octet != 0) {
+            all_zero = 0;
+        }
+        if (octet != 255) {
+            all_255 = 0;
+        }
+
+        if (part < 3) {
+            if (*end != '.') {
+                return 0;
+            }
+            p = end + 1;
+        } else if (*end != '\0') {
+            return 0;
+        }
+    }
+
+    return !all_zero && !all_255;
+}
+
+// 检查本地域名表路径是否非空、未超长，并且当前进程可打开读取。
+static int is_readable_table_file(const char *filename) {
+    FILE *fp;
+
+    if (filename == NULL || filename[0] == '\0') {
+        return 0;
+    }
+    if (!string_fits_config_buffer(filename, CONFIG_PATH_MAX)) {
+        return 0;
+    }
+
+    fp = fopen(filename, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+// config_init_defaults 写入所有默认配置项。
 void config_init_defaults(void) {
     g_config.listen_port = DEFAULT_DNS_PORT;
     copy_string(g_config.upstream_dns, sizeof(g_config.upstream_dns), DEFAULT_UPSTREAM_DNS);
@@ -70,6 +156,7 @@ void config_init_defaults(void) {
     g_config.idmap_timeout_ms = DEFAULT_IDMAP_TIMEOUT_MS;
 }
 
+// config_load_args 解析命令行选项；字符串类参数先校验后写入配置，避免错误推迟到后续模块。
 int config_load_args(int argc, char **argv) {
     int i;
 
@@ -85,9 +172,19 @@ int config_load_args(int argc, char **argv) {
                 return -1;
             }
         } else if ((strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--upstream") == 0) && i + 1 < argc) {
-            copy_string(g_config.upstream_dns, sizeof(g_config.upstream_dns), argv[++i]);
+            const char *upstream = argv[++i];
+            if (!string_fits_config_buffer(upstream, CONFIG_IP_MAX) || !is_valid_ipv4_literal(upstream)) {
+                log_error("invalid upstream DNS IP: %s", upstream);
+                return -1;
+            }
+            copy_string(g_config.upstream_dns, sizeof(g_config.upstream_dns), upstream);
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--table") == 0) && i + 1 < argc) {
-            copy_string(g_config.table_file, sizeof(g_config.table_file), argv[++i]);
+            const char *table_file = argv[++i];
+            if (!is_readable_table_file(table_file)) {
+                log_error("invalid or unreadable local table file: %s", table_file);
+                return -1;
+            }
+            copy_string(g_config.table_file, sizeof(g_config.table_file), table_file);
         } else if (strcmp(argv[i], "--event-timeout") == 0 && i + 1 < argc) {
             if (parse_positive_int(argv[++i], &g_config.event_loop_timeout_ms) != 0) {
                 log_error("invalid event timeout: %s", argv[i]);
@@ -105,19 +202,26 @@ int config_load_args(int argc, char **argv) {
         }
     }
 
+    if (!is_readable_table_file(g_config.table_file)) {
+        log_error("invalid or unreadable local table file: %s", g_config.table_file);
+        return -1;
+    }
+
     return 0;
 }
 
+// config_get 返回当前配置的只读访问入口。
 const Config *config_get(void) {
     return &g_config;
 }
 
+// config_print_usage 打印服务端支持的命令行参数。
 void config_print_usage(const char *program_name) {
     fprintf(stderr,
             "Usage: %s [options]\n"
             "Options:\n"
             "  -p, --port <port>           Listen UDP port, default 53\n"
-            "  -u, --upstream <ip>         Upstream DNS server, default 8.8.8.8\n"
+            "  -u, --upstream <ip>         Upstream DNS server, default 10.3.9.4\n"
             "  -t, --table <file>          Local table file, default data/dnsrelay.txt\n"
             "      --event-timeout <ms>    select wakeup interval, default 1000\n"
             "      --id-timeout <ms>       upstream response timeout, default 5000\n",

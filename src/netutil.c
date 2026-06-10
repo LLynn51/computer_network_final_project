@@ -68,6 +68,7 @@ socket_t udp_bind_socket(uint16_t port) {
     return sock;
 }
 
+// sockaddr_to_string 将IPv4地址部分转换成便于日志输出的字符串。
 const char *sockaddr_to_string(const struct sockaddr_in *addr, char *buf, int buflen) {
     if (addr == NULL || buf == NULL || buflen <= 0) {
         return "";

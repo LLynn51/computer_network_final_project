@@ -8,9 +8,10 @@
 
 #include <string.h>
 
+// 上游DNS服务器固定使用标准DNS端口。
 #define UPSTREAM_DNS_PORT 53
 
-// 没看懂
+// relay_get_upstream_addr 根据当前配置拼出上游DNS的IPv4 UDP地址。
 void relay_get_upstream_addr(struct sockaddr_in *addr) {
     if (addr == NULL) {
         return;
@@ -20,7 +21,8 @@ void relay_get_upstream_addr(struct sockaddr_in *addr) {
     addr->sin_port = htons(UPSTREAM_DNS_PORT);
     addr->sin_addr.s_addr = inet_addr(config_get()->upstream_dns);
 }
-// 没看懂
+
+// relay_is_from_upstream 用于区分主socket收到的是客户端查询还是上游响应。
 int relay_is_from_upstream(const struct sockaddr_in *addr) {
     struct sockaddr_in upstream_addr;
     if (addr == NULL) {
@@ -38,7 +40,9 @@ int relay_forward_query(socket_t sock,
                         int query_len,
                         const struct sockaddr_in *client_addr,
                         socklen_t client_len,
-                        const char *domain) {
+                        const char *domain,
+                        uint16_t qtype,
+                        uint16_t qclass) {
     struct sockaddr_in upstream_addr;
     uint16_t client_id;
     uint16_t upstream_id;
@@ -51,7 +55,7 @@ int relay_forward_query(socket_t sock,
     client_id = dns_get_id(query_buf, query_len);
 
     // 将客户端相关信息作为新的条目加入ID映射表（upstream_id段暂时留空），并检查
-    if (idmap_add(client_id, client_addr, client_len, domain, &upstream_id) != 0) {
+    if (idmap_add(client_id, client_addr, client_len, domain, qtype, qclass, &upstream_id) != 0) {
         log_warn("add id map failed domain=%s", domain == NULL ? "" : domain);
         return -1;
     }
@@ -84,6 +88,8 @@ int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int res
     char domain[256];
     uint32_t cache_ip;
     uint32_t ttl_sec;
+    uint16_t qtype;
+    uint16_t qclass;
     int n;
 
     if (sock == SOCKET_INVALID || response_buf == NULL || response_len <= 0) {
@@ -91,11 +97,17 @@ int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int res
     }
     // 获取上游 DNS 服务器 id
     upstream_id = dns_get_id(response_buf, response_len);
-    if (!idmap_find(upstream_id, &client_id, &client_addr, &client_len, domain, sizeof(domain))) {
+    if (!idmap_find(upstream_id, &client_id, &client_addr, &client_len, domain, sizeof(domain), &qtype, &qclass)) {
         log_warn("unknown upstream response id=%u", upstream_id);
         return -1;
     }
-    if (dns_extract_first_a_record(response_buf, response_len, &cache_ip, &ttl_sec)) {
+    if (!dns_response_matches_question(response_buf, response_len, domain, qtype, qclass)) {
+        log_warn("upstream response question mismatch domain=%s upstream_id=%u", domain, upstream_id);
+        idmap_remove(upstream_id);
+        return -1;
+    }
+    if (qtype == 1 && qclass == 1 &&
+        dns_extract_first_a_record_for_domain(response_buf, response_len, domain, &cache_ip, &ttl_sec)) {
         cache_store(domain, cache_ip, ttl_sec);
     }
     // 将上游DNS服务器响应的id设置为客户端请求的旧id

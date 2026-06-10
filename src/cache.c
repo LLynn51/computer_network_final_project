@@ -6,18 +6,27 @@
 #include <ctype.h>
 #include <string.h>
 
+// 缓存表最大条目数；满表时会覆盖最早过期的条目。
 #define CACHE_MAX_ENTRIES 1024
+
+// 缓存键使用的域名缓冲区长度。
 #define CACHE_MAX_DOMAIN_LEN 256
 
 typedef struct {
+    // 该槽位是否正在保存有效缓存项。
     int used;
+    // 小写规范化后的域名。
     char domain[CACHE_MAX_DOMAIN_LEN];
+    // 主机字节序 IPv4 地址。
     uint32_t ip;
+    // 过期时间点，单位为 net_now_ms() 的毫秒。
     uint64_t expire_at_ms;
 } CacheEntry;
 
+// 固定大小的内存 DNS A 记录缓存。
 static CacheEntry g_cache[CACHE_MAX_ENTRIES];
 
+// 将 ASCII 域名转换为小写，便于做大小写不敏感匹配。
 static void to_lower_ascii(char *s) {
     while (s != NULL && *s != '\0') {
         *s = (char)tolower((unsigned char)*s);
@@ -25,6 +34,7 @@ static void to_lower_ascii(char *s) {
     }
 }
 
+// 根据域名生成缓存键：复制到固定缓冲区并统一转为小写。
 static void make_key(const char *domain, char *out, int out_size) {
     if (out == NULL || out_size <= 0) {
         return;
@@ -40,10 +50,12 @@ static void make_key(const char *domain, char *out, int out_size) {
     to_lower_ascii(out);
 }
 
+// cache_init 清空所有缓存槽位。
 void cache_init(void) {
     memset(g_cache, 0, sizeof(g_cache));
 }
 
+// cache_lookup 查询未过期的缓存项；过期项会在命中检查时顺手删除。
 int cache_lookup(const char *domain, uint32_t *ip) {
     char key[CACHE_MAX_DOMAIN_LEN];
     uint64_t now = net_now_ms();
@@ -71,6 +83,7 @@ int cache_lookup(const char *domain, uint32_t *ip) {
     return 0;
 }
 
+// cache_store 写入或更新缓存；如果缓存满，覆盖过期时间最早的条目。
 void cache_store(const char *domain, uint32_t ip, uint32_t ttl_sec) {
     char key[CACHE_MAX_DOMAIN_LEN];
     uint64_t expire_at_ms;
@@ -111,6 +124,7 @@ void cache_store(const char *domain, uint32_t ip, uint32_t ttl_sec) {
     log_info("cache store domain=%s ttl=%u", domain, ttl_sec);
 }
 
+// cache_cleanup_expired 周期性清理所有已经过期的缓存项。
 void cache_cleanup_expired(uint64_t now_ms) {
     int i;
 

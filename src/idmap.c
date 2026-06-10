@@ -4,17 +4,24 @@
 
 #include <string.h>
 
+// 同时等待上游响应的最大转发请求数。
 #define IDMAP_MAX_ENTRIES 1024
 
 typedef struct {
-    int used; // 标记 ID映射表中的当前条目是否可以被覆盖（因为g_entries容量有限，需要覆盖原有条目来存储新条目）
+    int used; 
+    // 标记 ID映射表中的当前条目是否可以被覆盖（因为g_entries容量有限，需要覆盖原有条目来存储新条目）
     // 1 表示该槽位已被占用，保存着一个尚未完成的转发请求；
     // 0 表示该槽位空闲，可以写入新的映射。
     uint16_t upstream_id;
     uint16_t client_id;
     struct sockaddr_in client_addr;
     socklen_t client_len;
+    // 原始查询域名，用于校验上游响应并写入缓存。
     char domain[256];
+    // 原始查询类型，例如 A=1。
+    uint16_t qtype;
+    // 原始查询类别，例如 IN=1。
+    uint16_t qclass;
     uint64_t created_at_ms; // 创建时间戳
 } IDMapEntry; // 单条映射条目
 static IDMapEntry g_entries[IDMAP_MAX_ENTRIES]; // g_entries 存储所有ID映射
@@ -57,9 +64,14 @@ static int allocate_upstream_id(uint16_t *upstream_id) {
     return -1;
 }
 
-// idmap_add 在ID映射表中添加新条目
-int idmap_add(uint16_t client_id,const struct sockaddr_in *client_addr,
-              socklen_t client_len,const char *domain,uint16_t *upstream_id) {
+// idmap_add 在ID映射表中添加新条目，并返回转发给上游时使用的新ID。
+int idmap_add(uint16_t client_id,
+              const struct sockaddr_in *client_addr,
+              socklen_t client_len,
+              const char *domain,
+              uint16_t qtype,
+              uint16_t qclass,
+              uint16_t *upstream_id) {
     int i;
     uint16_t new_id;
     // 检查传入信息是否正常
@@ -79,6 +91,8 @@ int idmap_add(uint16_t client_id,const struct sockaddr_in *client_addr,
             g_entries[i].client_id = client_id;
             g_entries[i].client_addr = *client_addr;
             g_entries[i].client_len = client_len;
+            g_entries[i].qtype = qtype;
+            g_entries[i].qclass = qclass;
             g_entries[i].created_at_ms = net_now_ms();
             // 填入domain字段时注意结束符和为空处理
             if (domain != NULL) {
@@ -102,7 +116,9 @@ int idmap_find(uint16_t upstream_id,
                struct sockaddr_in *client_addr,
                socklen_t *client_len,
                char *domain,
-               int domain_size) {
+               int domain_size,
+               uint16_t *qtype,
+               uint16_t *qclass) {
     int i;
     // 遍历 idmap 中所有条目，寻找对应 id。 如果成功找到，就返回条目中存储的信息。
     for (i = 0; i < IDMAP_MAX_ENTRIES; i++) {
@@ -119,6 +135,12 @@ int idmap_find(uint16_t upstream_id,
             if (domain != NULL && domain_size > 0) {
                 strncpy(domain, g_entries[i].domain, (size_t)domain_size - 1);
                 domain[domain_size - 1] = '\0';
+            }
+            if (qtype != NULL) {
+                *qtype = g_entries[i].qtype;
+            }
+            if (qclass != NULL) {
+                *qclass = g_entries[i].qclass;
             }
             return 1;
         }

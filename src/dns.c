@@ -13,23 +13,30 @@ static uint16_t read_u16_be(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
+// write_u16_be 将16位无符号整数按网络字节序写入缓冲区。
 static void write_u16_be(uint8_t *p, uint16_t value) {
     p[0] = (uint8_t)(value >> 8);
     p[1] = (uint8_t)(value & 0xffu);
 }
 
+// write_u32_be 将32位无符号整数按网络字节序写入缓冲区。
 static void write_u32_be(uint8_t *p, uint32_t value) {
     p[0] = (uint8_t)(value >> 24);
     p[1] = (uint8_t)((value >> 16) & 0xffu);
     p[2] = (uint8_t)((value >> 8) & 0xffu);
     p[3] = (uint8_t)(value & 0xffu);
 }
+
 // find_question_end 返回 Question 结束后的第一个字节下标
 // 因为构造响应时需要原样复制HEADER和Question，再在结尾追加Answer
 static int find_question_end(const uint8_t *buf, int len) {
     int pos = DNS_HEADER_SIZE;
 
     if (buf == NULL || len < DNS_HEADER_SIZE) {
+        return -1;
+    }
+
+    if (read_u16_be(buf + 4) != 1) {
         return -1;
     }
 
@@ -53,6 +60,7 @@ static int find_question_end(const uint8_t *buf, int len) {
     return -1;
 }
 
+// skip_dns_name 跳过一个DNS NAME字段，支持普通label和压缩指针，返回下一个字段位置。
 static int skip_dns_name(const uint8_t *buf, int len, int pos) {
     while (pos < len) {
         uint8_t label_len = buf[pos++];
@@ -78,6 +86,97 @@ static int skip_dns_name(const uint8_t *buf, int len, int pos) {
     return -1;
 }
 
+// domain_equal_ascii_ci 比较两个域名字符串是否相同，忽略ASCII大小写。
+static int domain_equal_ascii_ci(const char *a, const char *b) {
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a;
+        char cb = *b;
+
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+// read_dns_name_to_string 将DNS NAME字段解码成点分域名，并处理响应中的压缩指针。
+static int read_dns_name_to_string(const uint8_t *buf, int len, int pos, char *out, int outsize, int *next_pos) {
+    int cur = pos;
+    int outpos = 0;
+    int jumped = 0;
+    int jump_count = 0;
+
+    if (buf == NULL || out == NULL || outsize <= 0 || next_pos == NULL || pos < 0 || pos >= len) {
+        return -1;
+    }
+
+    while (cur < len) {
+        uint8_t label_len = buf[cur++];
+
+        if (label_len == 0) {
+            if (!jumped) {
+                *next_pos = cur;
+            }
+            out[outpos] = '\0';
+            return 0;
+        }
+
+        if ((label_len & 0xC0u) == 0xC0u) {
+            int offset;
+            if (cur >= len) {
+                return -1;
+            }
+            offset = (int)(((label_len & 0x3Fu) << 8) | buf[cur++]);
+            if (offset < DNS_HEADER_SIZE || offset >= len) {
+                return -1;
+            }
+            if (!jumped) {
+                *next_pos = cur;
+            }
+            cur = offset;
+            jumped = 1;
+            if (++jump_count > DNS_MAX_DOMAIN_LEN) {
+                return -1;
+            }
+            continue;
+        }
+
+        if ((label_len & 0xC0u) != 0 || label_len > 63 || cur + label_len > len) {
+            return -1;
+        }
+
+        if (outpos != 0) {
+            if (outpos >= outsize - 1) {
+                return -1;
+            }
+            out[outpos++] = '.';
+        }
+
+        if (outpos + label_len >= outsize) {
+            return -1;
+        }
+        memcpy(out + outpos, buf + cur, label_len);
+        outpos += label_len;
+        cur += label_len;
+    }
+
+    return -1;
+}
+
+// write_qname 将点分域名写成DNS QNAME格式，例如 www.example.com -> 3www7example3com0。
 static int write_qname(const char *domain, uint8_t *outbuf, int outsize, int pos) {
     const char *label_start = domain;
     const char *p = domain;
@@ -138,7 +237,7 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     qdcount = read_u16_be(buf + 4);
     // 查询QR位是否为0（Query）。由于目前程序只处理Query，因此不是Query视为非法请求。
     // 同时query数量不能为0
-    if ((flags & 0x8000u) != 0 || qdcount == 0) {
+    if ((flags & 0x8000u) != 0 || qdcount != 1) {
         return -1;
     }
 
@@ -203,6 +302,7 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     return 0;
 }
 
+// dns_build_query 构建客户端测试程序使用的标准递归查询报文。
 int dns_build_query(const char *domain, uint16_t qtype, uint8_t *outbuf, int outsize, uint16_t *out_id) {
     int pos = DNS_HEADER_SIZE;
     uint16_t id;
@@ -234,6 +334,7 @@ int dns_build_query(const char *domain, uint16_t qtype, uint8_t *outbuf, int out
 
     return pos;
 }
+
 // dns_build_a_response 构建本地合法响应
 // 返回值： response_len
 // 返回信息（以指针形式）：*outbuf 构造完成的完整合法响应
@@ -272,7 +373,7 @@ int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, u
     pos += 4;
     write_u16_be(outbuf + pos, 4); // RDLENGTH。资源数据的字节数，对类型1（TYPE A记录）资源数据是4字节的I P地址
     pos += 2;
-    write_u32_be(outbuf + pos, ip); // RDATA IPv4，ip必须已经是网络字节序
+    write_u32_be(outbuf + pos, ip); // RDATA IPv4，内部ip使用主机字节序
     pos += 4;
 
     return pos;
@@ -321,6 +422,7 @@ int dns_is_response(const uint8_t *buf, int len) {
     return (read_u16_be(buf + 2) & 0x8000u) != 0;
 }
 
+// dns_extract_first_a_record 从任意成功响应中取出第一个IPv4 A记录和TTL。
 int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32_t *ttl_sec) {
     uint16_t flags;
     uint16_t qdcount;
@@ -388,6 +490,107 @@ int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32
     return 0;
 }
 
+// dns_extract_first_a_record_for_domain 只缓存owner name与原查询域名一致的A记录。
+int dns_extract_first_a_record_for_domain(const uint8_t *buf, int len, const char *domain, uint32_t *ip, uint32_t *ttl_sec) {
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    int pos;
+    int i;
+
+    if (buf == NULL || domain == NULL || ip == NULL || ttl_sec == NULL || len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+
+    flags = read_u16_be(buf + 2);
+    qdcount = read_u16_be(buf + 4);
+    ancount = read_u16_be(buf + 6);
+
+    if ((flags & 0x8000u) == 0 || (flags & 0x000fu) != 0 || qdcount == 0 || ancount == 0) {
+        return 0;
+    }
+
+    pos = DNS_HEADER_SIZE;
+    for (i = 0; i < qdcount; i++) {
+        pos = skip_dns_name(buf, len, pos);
+        if (pos < 0 || pos + 4 > len) {
+            return 0;
+        }
+        pos += 4;
+    }
+
+    for (i = 0; i < ancount; i++) {
+        char owner[DNS_MAX_DOMAIN_LEN];
+        uint16_t type;
+        uint16_t class_value;
+        uint16_t rdlength;
+        uint32_t ttl;
+
+        if (read_dns_name_to_string(buf, len, pos, owner, sizeof(owner), &pos) != 0) {
+            return 0;
+        }
+        if (pos + 10 > len) {
+            return 0;
+        }
+
+        type = read_u16_be(buf + pos);
+        class_value = read_u16_be(buf + pos + 2);
+        ttl = ((uint32_t)buf[pos + 4] << 24) |
+              ((uint32_t)buf[pos + 5] << 16) |
+              ((uint32_t)buf[pos + 6] << 8) |
+              (uint32_t)buf[pos + 7];
+        rdlength = read_u16_be(buf + pos + 8);
+        pos += 10;
+
+        if (pos + rdlength > len) {
+            return 0;
+        }
+
+        if (type == 1 && class_value == 1 && rdlength == 4 && domain_equal_ascii_ci(owner, domain)) {
+            *ip = ((uint32_t)buf[pos] << 24) |
+                  ((uint32_t)buf[pos + 1] << 16) |
+                  ((uint32_t)buf[pos + 2] << 8) |
+                  (uint32_t)buf[pos + 3];
+            *ttl_sec = ttl;
+            return 1;
+        }
+
+        pos += rdlength;
+    }
+
+    return 0;
+}
+
+// dns_response_matches_question 校验上游响应没有串包或被异常篡改。
+int dns_response_matches_question(const uint8_t *buf, int len, const char *domain, uint16_t qtype, uint16_t qclass) {
+    uint16_t flags;
+    uint16_t qdcount;
+    char qname[DNS_MAX_DOMAIN_LEN];
+    int pos;
+
+    if (buf == NULL || domain == NULL || len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+
+    flags = read_u16_be(buf + 2);
+    qdcount = read_u16_be(buf + 4);
+    if ((flags & 0x8000u) == 0 || qdcount != 1) {
+        return 0;
+    }
+
+    if (read_dns_name_to_string(buf, len, DNS_HEADER_SIZE, qname, sizeof(qname), &pos) != 0) {
+        return 0;
+    }
+    if (pos + 4 > len) {
+        return 0;
+    }
+
+    return domain_equal_ascii_ci(qname, domain) &&
+           read_u16_be(buf + pos) == qtype &&
+           read_u16_be(buf + pos + 2) == qclass;
+}
+
+// dns_parse_response 解析客户端关心的响应摘要，用于Client程序展示查询结果。
 int dns_parse_response(const uint8_t *buf, int len, DNSResponse *response) {
     uint16_t flags;
 

@@ -15,12 +15,16 @@
 #include <arpa/inet.h>
 #endif
 
+// 本地域名表单行最大长度。
 #define TABLE_LINE_LEN 512
 
 // TableNode 以链表形式存储域名和对应ip
 typedef struct TableNode {
+    // 小写规范化后的域名。
     char domain[256];
+    // 主机字节序IPv4地址；0表示拦截域名。
     uint32_t ip;
+    // 指向下一个表项。
     struct TableNode *next;
 } TableNode;
 // g_table 本地 DNS 表的链表头指针
@@ -47,6 +51,7 @@ static void to_lower_ascii(char *s) {
     }
 }
 
+// parse_ip 将IPv4字面量解析成主机字节序整数，成功返回1。
 static int parse_ip(const char *s, uint32_t *ip) {
     unsigned long addr;
     if (s == NULL || ip == NULL) {
@@ -57,7 +62,7 @@ static int parse_ip(const char *s, uint32_t *ip) {
     if (addr == INADDR_NONE && strcmp(s, "255.255.255.255") != 0) {
         return 0; // INADDR_NONE 非法地址格式 并且 排除稀有的全 1 域名
     }
-    *ip = (uint32_t)addr;
+    *ip = ntohl((uint32_t)addr);
     return 1;
 }
 
@@ -85,9 +90,8 @@ static int add_entry(const char *domain, uint32_t ip) {
     return 0;
 }
 
-// table_free 操作完成后释放 TableNode 链表
+// table_free 操作完成后释放 TableNode 链表。
 void table_free(void) {
-    // 就是一般的释放列表，没什么好多说的
     TableNode *node = g_table;
     while (node != NULL) {
         TableNode *next = node->next;
@@ -162,8 +166,8 @@ int table_lookup(const char *domain, uint32_t *ip) {
     strncpy(key, domain, sizeof(key) - 1);
     key[sizeof(key) - 1] = '\0';
     to_lower_ascii(key);
-    // 从本地表头指针指针开始在本地表中查询，命中则返回1
-    // TODO:疑似没有实现对“没有找到”和“拦截域名”的区分
+    // 从本地表头指针开始在本地表中查询，命中则返回1。
+    // 是否拦截由返回值和*ip共同判断：返回0表示未找到；返回1且*ip为0表示命中拦截规则。
     for (node = g_table; node != NULL; node = node->next) {
         if (strcmp(node->domain, key) == 0) {
             *ip = node->ip; // 如果 *ip==0 ，说明是被拦截的域名；否则是正常返回的域名

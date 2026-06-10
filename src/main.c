@@ -12,6 +12,7 @@
 #include <stdlib.h>
 
 // 由于UDP协议不可信，因此每次每次调用协议解析器都需要检查边界
+// Main 程序入口：启动DNS Relay服务端，接收客户端查询并处理本地命中、缓存命中或上游转发。
 int main(int argc, char **argv) {
     const Config *config;
     socket_t sock;
@@ -60,7 +61,6 @@ int main(int argc, char **argv) {
         int response_len;
 
 
-        printf("waiting...\n");
 
         ready = net_wait_readable(sock, config->event_loop_timeout_ms);
         if (ready < 0) {
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
                         } else {
                             log_warn("build cache response failed domain=%s", query.domain);
                         }
-                    } else if (relay_forward_query(sock, buf, n, &src_addr, src_len, query.domain) != 0) {
+                    } else if (relay_forward_query(sock, buf, n, &src_addr, src_len, query.domain, query.qtype, query.qclass) != 0) {
                         // 本地未命中时，复用主socket转发给上游DNS；响应会在后续recvfrom中收到
                         log_warn("forward failed domain=%s", query.domain);
                     }

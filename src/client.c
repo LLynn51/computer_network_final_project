@@ -8,10 +8,16 @@
 #include <string.h>
 #include <time.h>
 
+// 客户端默认查询本机 DNS Relay。
 #define DEFAULT_DNS_SERVER "127.0.0.1"
+
+// DNS 默认服务端口。
 #define DEFAULT_DNS_PORT 53
+
+// 客户端等待 DNS 响应的最长时间，单位毫秒。
 #define CLIENT_TIMEOUT_MS 3000
 
+// 打印客户端命令行用法。
 static void print_usage(const char *program_name) {
     fprintf(stderr,
             "Usage: %s <domain> [dns_server] [dns_port]\n"
@@ -23,6 +29,7 @@ static void print_usage(const char *program_name) {
             program_name);
 }
 
+// 将端口字符串解析为 1..65535 范围内的 uint16_t。
 static int parse_port(const char *s, uint16_t *port) {
     long value;
     char *end = NULL;
@@ -40,12 +47,14 @@ static int parse_port(const char *s, uint16_t *port) {
     return 0;
 }
 
+// 按点分十进制格式打印主机字节序 IPv4 地址。
 static void print_ipv4(uint32_t ip) {
     struct in_addr addr;
-    addr.s_addr = ip;
+    addr.s_addr = htonl(ip);
     printf("%s", inet_ntoa(addr));
 }
 
+// Client 程序入口：构造 DNS 查询、发送到指定服务器并解析响应。
 int main(int argc, char **argv) {
     const char *domain;
     const char *dns_server = DEFAULT_DNS_SERVER;
