@@ -1,5 +1,6 @@
 #include "idmap.h"
 
+#include "dns.h"
 #include "logger.h"
 
 #include <string.h>
@@ -14,8 +15,10 @@ typedef struct {
     // 0 表示该槽位空闲，可以写入新的映射。
     uint16_t upstream_id;
     uint16_t client_id;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     socklen_t client_len;
+    uint8_t query_buf[DNS_MAX_PACKET_SIZE];
+    int query_len;
     // 原始查询域名，用于校验上游响应并写入缓存。
     char domain[256];
     // 原始查询类型，例如 A=1。
@@ -66,8 +69,10 @@ static int allocate_upstream_id(uint16_t *upstream_id) {
 
 // idmap_add 在ID映射表中添加新条目，并返回转发给上游时使用的新ID。
 int idmap_add(uint16_t client_id,
-              const struct sockaddr_in *client_addr,
+              const struct sockaddr *client_addr,
               socklen_t client_len,
+              const uint8_t *query_buf,
+              int query_len,
               const char *domain,
               uint16_t qtype,
               uint16_t qclass,
@@ -75,7 +80,9 @@ int idmap_add(uint16_t client_id,
     int i;
     uint16_t new_id;
     // 检查传入信息是否正常
-    if (client_addr == NULL || upstream_id == NULL) {
+    if (client_addr == NULL || upstream_id == NULL || query_buf == NULL ||
+        client_len <= 0 || client_len > (socklen_t)sizeof(struct sockaddr_storage) ||
+        query_len <= 0 || query_len > DNS_MAX_PACKET_SIZE) {
         return -1;
     }
     // 检查是否成功为上游DNS响应成功分配id
@@ -89,8 +96,11 @@ int idmap_add(uint16_t client_id,
             // 把客户端原ID保存起来，并为转发给上游DNS的请求分配新ID；上游响应会携带这个新ID，后续靠它查回原客户端和原ID。
             g_entries[i].upstream_id = new_id; 
             g_entries[i].client_id = client_id;
-            g_entries[i].client_addr = *client_addr;
+            memset(&g_entries[i].client_addr, 0, sizeof(g_entries[i].client_addr));
+            memcpy(&g_entries[i].client_addr, client_addr, (size_t)client_len);
             g_entries[i].client_len = client_len;
+            memcpy(g_entries[i].query_buf, query_buf, (size_t)query_len);
+            g_entries[i].query_len = query_len;
             g_entries[i].qtype = qtype;
             g_entries[i].qclass = qclass;
             g_entries[i].created_at_ms = net_now_ms();
@@ -113,7 +123,7 @@ int idmap_add(uint16_t client_id,
 // idmap_find 寻找和上游DNS响应id对应的客户端请求id
 int idmap_find(uint16_t upstream_id,
                uint16_t *client_id,
-               struct sockaddr_in *client_addr,
+               struct sockaddr_storage *client_addr,
                socklen_t *client_len,
                char *domain,
                int domain_size,
@@ -164,16 +174,44 @@ void idmap_remove(uint16_t upstream_id) {
 // idmap_cleanup_timeout 清理超过timeout_ms仍未收到上游DNS响应的映射项
 // 参数 timeout_ms 一般直接传入默认值
 // 每次报错和转发时调用
-void idmap_cleanup_timeout(uint64_t now_ms, uint64_t timeout_ms) {
+void idmap_cleanup_timeout(socket_t sock, uint64_t now_ms, uint64_t timeout_ms) {
     int i;
     // 遍历ID映射表，对于正在使用且超时的条目进行清理
     for (i = 0; i < IDMAP_MAX_ENTRIES; i++) {
         if (g_entries[i].used && now_ms - g_entries[i].created_at_ms >= timeout_ms) {
+            uint8_t response[DNS_MAX_PACKET_SIZE];
+            int response_len;
+            int n;
+
             log_warn("upstream timeout domain=%s client_id=%u upstream_id=%u age=%llu ms",
                      g_entries[i].domain,
                      g_entries[i].client_id,
                      g_entries[i].upstream_id,
                      (unsigned long long)(now_ms - g_entries[i].created_at_ms));
+
+            response_len = dns_build_error_response(g_entries[i].query_buf,
+                                                    g_entries[i].query_len,
+                                                    DNS_RCODE_SERVFAIL,
+                                                    response,
+                                                    sizeof(response));
+            if (response_len > 0 && sock != SOCKET_INVALID) {
+                n = (int)sendto(sock, (const char *)response, response_len, 0,
+                                (struct sockaddr *)&g_entries[i].client_addr,
+                                g_entries[i].client_len);
+                if (n == response_len) {
+                    log_info("return SERVFAIL to client domain=%s client_id=%u",
+                             g_entries[i].domain,
+                             g_entries[i].client_id);
+                } else {
+                    log_warn("send SERVFAIL to client failed domain=%s client_id=%u",
+                             g_entries[i].domain,
+                             g_entries[i].client_id);
+                }
+            } else {
+                log_warn("build SERVFAIL failed domain=%s client_id=%u",
+                         g_entries[i].domain,
+                         g_entries[i].client_id);
+            }
             memset(&g_entries[i], 0, sizeof(g_entries[i]));
         }
     }

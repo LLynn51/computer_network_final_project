@@ -13,6 +13,8 @@
 - DNS ID 映射，支持多个客户端并发查询
 - `select()` 事件循环，避免忙等待
 - 上游响应超时清理
+- 上游转发失败或响应超时时向客户端返回 SERVFAIL
+- `127.0.0.1` 反向 PTR 查询返回 `localhost`
 - A 记录缓存，按 TTL 过期
 - 模块化代码结构和封装日志输出
 
@@ -137,6 +139,15 @@ nslookup -port=5353 ads.example.com 127.0.0.1
 .\build\Client.exe ads.example.com 127.0.0.1 5353
 ```
 
+上游无响应时，Relay 会在 ID 映射超时后返回 SERVFAIL，而不是让客户端一直等到本地超时：
+
+```powershell
+.\build\Main.exe --port 5353 --upstream 192.0.2.1 --event-timeout 50 --id-timeout 200
+.\build\Client.exe timeout-fallback-test.example 127.0.0.1 5353
+```
+
+客户端会显示 `SERVFAIL(RCODE=2)`。
+
 客户端参数：
 
 ```text
@@ -154,7 +165,7 @@ Client.exe <domain> [dns_server] [dns_port]
 - 主要支持 IPv4 A 记录
 - 缓存只保存上游响应中的第一个 A 记录
 - 不缓存 NXDOMAIN、AAAA、CNAME 链和 SERVFAIL
-- 上游超时后只清理 ID 映射，不主动给客户端返回 SERVFAIL
+- 上游转发失败或超时后会清理 ID 映射，并向客户端返回 SERVFAIL
 - 本地拦截当前返回 NXDOMAIN
 
 这些限制不影响基本 DNS Relay 课程设计流程，但如果需要更完整 DNS 行为，可以继续扩展。

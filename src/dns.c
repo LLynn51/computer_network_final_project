@@ -27,39 +27,6 @@ static void write_u32_be(uint8_t *p, uint32_t value) {
     p[3] = (uint8_t)(value & 0xffu);
 }
 
-// find_question_end 返回 Question 结束后的第一个字节下标
-// 因为构造响应时需要原样复制HEADER和Question，再在结尾追加Answer
-static int find_question_end(const uint8_t *buf, int len) {
-    int pos = DNS_HEADER_SIZE;
-
-    if (buf == NULL || len < DNS_HEADER_SIZE) {
-        return -1;
-    }
-
-    if (read_u16_be(buf + 4) != 1) {
-        return -1;
-    }
-
-    while (pos < len) {
-        uint8_t label_len = buf[pos++];
-
-        if (label_len == 0) {
-            if (pos + 4 <= len) {
-                return pos + 4;
-            }
-            return -1;
-        }
-
-        if ((label_len & 0xC0u) != 0 || label_len > 63 || pos + label_len > len) {
-            return -1;
-        }
-
-        pos += label_len;
-    }
-
-    return -1;
-}
-
 // skip_dns_name 跳过一个DNS NAME字段，支持普通label和压缩指针，返回下一个字段位置。
 static int skip_dns_name(const uint8_t *buf, int len, int pos) {
     while (pos < len) {
@@ -214,6 +181,34 @@ static int write_qname(const char *domain, uint8_t *outbuf, int outsize, int pos
     return pos;
 }
 
+// copy_question_for_response 将原始查询中的Question规范化写入响应，避免压缩QNAME形成无效指针链。
+static int copy_question_for_response(const uint8_t *query_buf, int query_len, uint8_t *outbuf, int outsize) {
+    char domain[DNS_MAX_DOMAIN_LEN];
+    int pos = DNS_HEADER_SIZE;
+    int qtype_pos;
+
+    if (query_buf == NULL || outbuf == NULL || query_len < DNS_HEADER_SIZE || outsize < DNS_HEADER_SIZE) {
+        return -1;
+    }
+    if (read_u16_be(query_buf + 4) != 1) {
+        return -1;
+    }
+
+    if (read_dns_name_to_string(query_buf, query_len, DNS_HEADER_SIZE, domain, sizeof(domain), &qtype_pos) != 0 ||
+        domain[0] == '\0' || qtype_pos + 4 > query_len) {
+        return -1;
+    }
+
+    memcpy(outbuf, query_buf, DNS_HEADER_SIZE);
+    pos = write_qname(domain, outbuf, outsize, pos);
+    if (pos < 0 || pos + 4 > outsize) {
+        return -1;
+    }
+
+    memcpy(outbuf + pos, query_buf + qtype_pos, 4);
+    return pos + 4;
+}
+
 // dns_parse_query 解析DNS报文
 // 参数： buf recv_from()收到的报文原始数据
 // len buf总长度，来自recvfrom返回值。因为网络数据不可信，所以需要时时检查以防越界。
@@ -221,7 +216,6 @@ static int write_qname(const char *domain, uint8_t *outbuf, int outsize, int pos
 // 返回值： 0 合法 -1 非法
 int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     int pos = DNS_HEADER_SIZE;// pos 当前读到哪里（单位：字节）。由于仅解析域名，所以初始化为HEADER长度。
-    int out = 0; // out 当前已经向 query->domain写入字符的数量
     uint16_t flags; // HEADER中的flag字段，包括 QR、OPCODE、AA……
     uint16_t qdcount; // 询问的数量（通常为1）
 
@@ -242,49 +236,9 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
     }
 
 
-    // 最关键的QNAME解析主循环
-    while (pos < len) { // pos >= len 说明读到包末尾，应该停止。
-        // 假设客户端输入的域名为www.baidu.com，那么DNS域名格式实际为3www5baidu3com0
-        // 每次首先读入字符长度，再根据长度读入相应数量的字符，从而实现字符串解析
-        uint8_t label_len = buf[pos++];
-
-        // return -1 表示包非法，需要立刻停止接收； break 代表当前循环结束但包依然合法。
-
-        if (label_len == 0) { // DNS域名格式以0作为结束符
-            break;
-        }
-        // 起步阶段直接拒绝DNS压缩格式，留到后面实现
-        if ((label_len & 0xC0u) != 0) {
-            return -1;
-        }
-
-        if (label_len > 63 || pos + label_len > len) { // 防止 label 越界 或 label_len 越界（包损坏）
-            return -1;
-        }
-
-        // 如果不是第一个label，需要在读入label_len后加'.'
-        if (out != 0) {
-            // 越界检查
-            if (out >= DNS_MAX_DOMAIN_LEN - 1) {
-                return -1;
-            }
-            query->domain[out++] = '.';
-        }
-
-        // 越界检查
-        if (out + label_len >= DNS_MAX_DOMAIN_LEN) {
-            return -1;
-        }
-
-        // 从报文复制字符串到domain
-        memcpy(query->domain + out, buf + pos, label_len);
-        // 指针各自移动
-        out += label_len;
-        pos += label_len;
-    }
-
-    // 检查读越界/域名为空
-    if (pos > len || out == 0) {
+    // 解析QNAME，支持普通label和DNS压缩指针。
+    if (read_dns_name_to_string(buf, len, pos, query->domain, sizeof(query->domain), &pos) != 0 ||
+        query->domain[0] == '\0') {
         return -1;
     }
 
@@ -293,10 +247,8 @@ int dns_parse_query(const uint8_t *buf, int len, DNSQuery *query) {
         return -1;
     }
 
-    // 在域名结尾添加'\0'结束符使其成为真正的字符串
-    query->domain[out] = '\0';
     // 添加QTYPE和QCLASS
-    query->qtype = read_u16_be(buf + pos); // 一般 A（1） 表示IPv4地址
+    query->qtype = read_u16_be(buf + pos); // A=1 表示IPv4地址，AAAA=28 表示IPv6地址
     query->qclass = read_u16_be(buf + pos + 2); // 一般 IN （1） 表示 Internet
     // 解析成功，返回0
     return 0;
@@ -329,7 +281,7 @@ int dns_build_query(const char *domain, uint16_t qtype, uint8_t *outbuf, int out
 
     write_u16_be(outbuf + pos, qtype);
     pos += 2;
-    write_u16_be(outbuf + pos, 1); // QCLASS IN
+    write_u16_be(outbuf + pos, DNS_CLASS_IN); // QCLASS IN
     pos += 2;
 
     return pos;
@@ -339,15 +291,13 @@ int dns_build_query(const char *domain, uint16_t qtype, uint8_t *outbuf, int out
 // 返回值： response_len
 // 返回信息（以指针形式）：*outbuf 构造完成的完整合法响应
 int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, uint8_t *outbuf, int outsize) {
-    int question_end = find_question_end(query_buf, query_len);
+    int question_end = copy_question_for_response(query_buf, query_len, outbuf, outsize);
     int pos;
 
     if (question_end < 0 || outbuf == NULL || outsize < question_end + 16) {
         return -1;
     }
-    // 构造响应：
-    // 先原样复制请求中的HEADER和QUESTION部分
-    memcpy(outbuf, query_buf, (size_t)question_end);
+    // 构造响应：先写入HEADER和规范化后的QUESTION部分
     // 根据响应性质，覆写flag字段
     // flags: QR=1, OPCODE沿用查询，AA=1，RD沿用查询，RA=0，RCODE=0
     outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
@@ -364,9 +314,9 @@ int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, u
     // 0xC00C中第一个C意为NAME字段为DNS压缩指针而非domain字符串；第二个C意思是“NAME字段指向偏移12处的域名”。
     // 可以避免重复写入domain，直接去DNS Header中读取
     pos += 2;
-    write_u16_be(outbuf + pos, 1); // TYPE A
+    write_u16_be(outbuf + pos, DNS_TYPE_A); // TYPE A
     pos += 2;
-    write_u16_be(outbuf + pos, 1); // CLASS IN
+    write_u16_be(outbuf + pos, DNS_CLASS_IN); // CLASS IN
     pos += 2;
     write_u32_be(outbuf + pos, 60); // TTL。客户程序保留该资源记录的秒数。
     // TODO:完善缓存机制
@@ -378,20 +328,51 @@ int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, u
 
     return pos;
 }
+
+// dns_build_aaaa_response 构建本地AAAA响应。
+int dns_build_aaaa_response(const uint8_t *query_buf, int query_len, const uint8_t ipv6[16], uint8_t *outbuf, int outsize) {
+    int question_end = copy_question_for_response(query_buf, query_len, outbuf, outsize);
+    int pos;
+
+    if (question_end < 0 || ipv6 == NULL || outbuf == NULL || outsize < question_end + 28) {
+        return -1;
+    }
+
+    outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
+    outbuf[3] = 0x00;
+    write_u16_be(outbuf + 4, 1); // QDCOUNT
+    write_u16_be(outbuf + 6, 1); // ANCOUNT
+    write_u16_be(outbuf + 8, 0); // NSCOUNT
+    write_u16_be(outbuf + 10, 0); // ARCOUNT
+
+    pos = question_end;
+    write_u16_be(outbuf + pos, 0xC00C); // NAME 指向请求中的QNAME
+    pos += 2;
+    write_u16_be(outbuf + pos, DNS_TYPE_AAAA); // TYPE AAAA
+    pos += 2;
+    write_u16_be(outbuf + pos, DNS_CLASS_IN); // CLASS IN
+    pos += 2;
+    write_u32_be(outbuf + pos, 60); // TTL
+    pos += 4;
+    write_u16_be(outbuf + pos, 16); // RDLENGTH
+    pos += 2;
+    memcpy(outbuf + pos, ipv6, 16); // RDATA IPv6，网络字节序16字节
+    pos += 16;
+
+    return pos;
+}
 // dns_build_nxdomain_response 对于本地被拦截的域名构建NXDOMAIN响应
 // 大体与上面的合法响应相同。区别是因为没有合法响应，所以不需构造ANSWER部分。
 int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t *outbuf, int outsize) {
-    int question_end = find_question_end(query_buf, query_len);
+    int question_end = copy_question_for_response(query_buf, query_len, outbuf, outsize);
 
     if (question_end < 0 || outbuf == NULL || outsize < question_end) {
         return -1;
     }
 
-    memcpy(outbuf, query_buf, (size_t)question_end);
-
     // flags: QR=1, AA=1，RCODE=3(NXDOMAIN)
     outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
-    outbuf[3] = 0x03;
+    outbuf[3] = DNS_RCODE_NXDOMAIN;
     // 更新各个COUNT字段
     write_u16_be(outbuf + 4, 1);
     write_u16_be(outbuf + 6, 0);// 与合法响应不同的是ANCOUNT为0（没有合法回答） 
@@ -399,6 +380,67 @@ int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t
     write_u16_be(outbuf + 10, 0);
 
     return question_end;
+}
+
+// dns_build_error_response 构造无Answer的错误响应，用于上游超时等情况。
+int dns_build_error_response(const uint8_t *query_buf, int query_len, uint16_t rcode, uint8_t *outbuf, int outsize) {
+    int question_end = copy_question_for_response(query_buf, query_len, outbuf, outsize);
+
+    if (question_end < 0 || outbuf == NULL || outsize < question_end || rcode > 15) {
+        return -1;
+    }
+
+    // flags: QR=1，保留OPCODE和RD，AA/RA均为0，低4位写入RCODE。
+    outbuf[2] = (uint8_t)((query_buf[2] & 0x79u) | 0x80u);
+    outbuf[3] = (uint8_t)(rcode & 0x0fu);
+    write_u16_be(outbuf + 4, 1);
+    write_u16_be(outbuf + 6, 0);
+    write_u16_be(outbuf + 8, 0);
+    write_u16_be(outbuf + 10, 0);
+
+    return question_end;
+}
+
+// dns_build_ptr_response 构造一个本地 PTR 响应，例如 1.0.0.127.in-addr.arpa -> localhost。
+int dns_build_ptr_response(const uint8_t *query_buf, int query_len, const char *ptr_domain, uint8_t *outbuf, int outsize) {
+    int question_end = copy_question_for_response(query_buf, query_len, outbuf, outsize);
+    int pos;
+    int rdlength_pos;
+
+    if (question_end < 0 || ptr_domain == NULL || ptr_domain[0] == '\0' || outbuf == NULL || outsize < question_end + 12) {
+        return -1;
+    }
+
+    // flags: QR=1, AA=1, RD沿用查询, RCODE=0。
+    outbuf[2] = (uint8_t)((query_buf[2] & 0x78u) | 0x84u | (query_buf[2] & 0x01u));
+    outbuf[3] = 0x00;
+    write_u16_be(outbuf + 4, 1);
+    write_u16_be(outbuf + 6, 1);
+    write_u16_be(outbuf + 8, 0);
+    write_u16_be(outbuf + 10, 0);
+
+    pos = question_end;
+    if (pos + 12 > outsize) {
+        return -1;
+    }
+    write_u16_be(outbuf + pos, 0xC00C); // Answer NAME 指向原始QNAME。
+    pos += 2;
+    write_u16_be(outbuf + pos, DNS_TYPE_PTR); // TYPE PTR
+    pos += 2;
+    write_u16_be(outbuf + pos, DNS_CLASS_IN); // CLASS IN
+    pos += 2;
+    write_u32_be(outbuf + pos, 60);
+    pos += 4;
+    rdlength_pos = pos;
+    pos += 2;
+
+    pos = write_qname(ptr_domain, outbuf, outsize, pos);
+    if (pos < 0) {
+        return -1;
+    }
+    write_u16_be(outbuf + rdlength_pos, (uint16_t)(pos - rdlength_pos - 2));
+
+    return pos;
 }
 // dns_get_id 从上游响应内容中读取上游id
 uint16_t dns_get_id(const uint8_t *buf, int len) {
@@ -475,7 +517,7 @@ int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32
             return 0;
         }
 
-        if (type == 1 && class_value == 1 && rdlength == 4) {
+        if (type == DNS_TYPE_A && class_value == DNS_CLASS_IN && rdlength == 4) {
             *ip = ((uint32_t)buf[pos] << 24) |
                   ((uint32_t)buf[pos + 1] << 16) |
                   ((uint32_t)buf[pos + 2] << 8) |
@@ -546,11 +588,79 @@ int dns_extract_first_a_record_for_domain(const uint8_t *buf, int len, const cha
             return 0;
         }
 
-        if (type == 1 && class_value == 1 && rdlength == 4 && domain_equal_ascii_ci(owner, domain)) {
+        if (type == DNS_TYPE_A && class_value == DNS_CLASS_IN && rdlength == 4 && domain_equal_ascii_ci(owner, domain)) {
             *ip = ((uint32_t)buf[pos] << 24) |
                   ((uint32_t)buf[pos + 1] << 16) |
                   ((uint32_t)buf[pos + 2] << 8) |
                   (uint32_t)buf[pos + 3];
+            *ttl_sec = ttl;
+            return 1;
+        }
+
+        pos += rdlength;
+    }
+
+    return 0;
+}
+
+// dns_extract_first_aaaa_record_for_domain 只缓存owner name与原查询域名一致的AAAA记录。
+int dns_extract_first_aaaa_record_for_domain(const uint8_t *buf, int len, const char *domain, uint8_t ipv6[16], uint32_t *ttl_sec) {
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    int pos;
+    int i;
+
+    if (buf == NULL || domain == NULL || ipv6 == NULL || ttl_sec == NULL || len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+
+    flags = read_u16_be(buf + 2);
+    qdcount = read_u16_be(buf + 4);
+    ancount = read_u16_be(buf + 6);
+
+    if ((flags & 0x8000u) == 0 || (flags & 0x000fu) != 0 || qdcount == 0 || ancount == 0) {
+        return 0;
+    }
+
+    pos = DNS_HEADER_SIZE;
+    for (i = 0; i < qdcount; i++) {
+        pos = skip_dns_name(buf, len, pos);
+        if (pos < 0 || pos + 4 > len) {
+            return 0;
+        }
+        pos += 4;
+    }
+
+    for (i = 0; i < ancount; i++) {
+        char owner[DNS_MAX_DOMAIN_LEN];
+        uint16_t type;
+        uint16_t class_value;
+        uint16_t rdlength;
+        uint32_t ttl;
+
+        if (read_dns_name_to_string(buf, len, pos, owner, sizeof(owner), &pos) != 0) {
+            return 0;
+        }
+        if (pos + 10 > len) {
+            return 0;
+        }
+
+        type = read_u16_be(buf + pos);
+        class_value = read_u16_be(buf + pos + 2);
+        ttl = ((uint32_t)buf[pos + 4] << 24) |
+              ((uint32_t)buf[pos + 5] << 16) |
+              ((uint32_t)buf[pos + 6] << 8) |
+              (uint32_t)buf[pos + 7];
+        rdlength = read_u16_be(buf + pos + 8);
+        pos += 10;
+
+        if (pos + rdlength > len) {
+            return 0;
+        }
+
+        if (type == DNS_TYPE_AAAA && class_value == DNS_CLASS_IN && rdlength == 16 && domain_equal_ascii_ci(owner, domain)) {
+            memcpy(ipv6, buf + pos, 16);
             *ttl_sec = ttl;
             return 1;
         }
