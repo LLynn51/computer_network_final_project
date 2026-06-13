@@ -11,39 +11,143 @@
 // 上游DNS服务器固定使用标准DNS端口。
 #define UPSTREAM_DNS_PORT 53
 
-// relay_get_upstream_addr 根据当前配置拼出上游DNS的IPv4 UDP地址。
-void relay_get_upstream_addr(struct sockaddr_in *addr) {
-    if (addr == NULL) {
+static void relay_send_servfail(socket_t sock,
+                                const uint8_t *query_buf,
+                                int query_len,
+                                const struct sockaddr *client_addr,
+                                socklen_t client_len,
+                                const char *domain) {
+    uint8_t response[DNS_MAX_PACKET_SIZE];
+    int response_len;
+    int n;
+
+    response_len = dns_build_error_response(query_buf,
+                                            query_len,
+                                            DNS_RCODE_SERVFAIL,
+                                            response,
+                                            sizeof(response));
+    if (response_len <= 0) {
+        log_warn("build SERVFAIL failed domain=%s", domain == NULL ? "" : domain);
         return;
     }
-    memset(addr, 0, sizeof(*addr));
-    addr->sin_family = AF_INET;
-    addr->sin_port = htons(UPSTREAM_DNS_PORT);
-    addr->sin_addr.s_addr = inet_addr(config_get()->upstream_dns);
+
+    n = (int)sendto(sock, (const char *)response, response_len, 0,
+                   (const struct sockaddr *)client_addr, client_len);
+    if (n != response_len) {
+        log_warn("send SERVFAIL to client failed domain=%s", domain == NULL ? "" : domain);
+    }
 }
 
-// relay_is_from_upstream 用于区分主socket收到的是客户端查询还是上游响应。
-int relay_is_from_upstream(const struct sockaddr_in *addr) {
-    struct sockaddr_in upstream_addr;
+static int is_v4_mapped_addr(const struct in6_addr *addr) {
+    const uint8_t *b;
+    int i;
+
     if (addr == NULL) {
         return 0;
     }
-    relay_get_upstream_addr(&upstream_addr);
-    return addr->sin_family == AF_INET &&
-           addr->sin_port == upstream_addr.sin_port &&
-           addr->sin_addr.s_addr == upstream_addr.sin_addr.s_addr;
+
+    b = (const uint8_t *)addr->s6_addr;
+    for (i = 0; i < 10; i++) {
+        if (b[i] != 0) {
+            return 0;
+        }
+    }
+
+    return b[10] == 0xff && b[11] == 0xff;
+}
+
+static int sockaddr_addr_equal(const struct sockaddr *a, const struct sockaddr *b) {
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    if (a->sa_family == AF_INET && b->sa_family == AF_INET) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
+        return a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+    }
+
+    if (a->sa_family == AF_INET6 && b->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+        return memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
+    }
+
+    if (a->sa_family == AF_INET && b->sa_family == AF_INET6) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+        return is_v4_mapped_addr(&b6->sin6_addr) &&
+               memcmp(&a4->sin_addr, &b6->sin6_addr.s6_addr[12], sizeof(a4->sin_addr)) == 0;
+    }
+
+    if (a->sa_family == AF_INET6 && b->sa_family == AF_INET) {
+        return sockaddr_addr_equal(b, a);
+    }
+
+    return 0;
+}
+
+static int sockaddr_endpoint_equal(const struct sockaddr *a, const struct sockaddr *b) {
+    return sockaddr_port(a) == sockaddr_port(b) && sockaddr_addr_equal(a, b);
+}
+
+// relay_get_upstream_addr 根据当前配置拼出上游DNS的IPv4/IPv6 UDP地址。
+int relay_get_upstream_addr(struct sockaddr_storage *addr, socklen_t *addr_len) {
+    struct sockaddr_in6 *addr6;
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    const char *upstream;
+
+    if (addr == NULL || addr_len == NULL) {
+        return -1;
+    }
+    memset(addr, 0, sizeof(*addr));
+    upstream = config_get()->upstream_dns;
+    addr6 = (struct sockaddr_in6 *)addr;
+    addr6->sin6_family = AF_INET6;
+    addr6->sin6_port = htons(UPSTREAM_DNS_PORT);
+    *addr_len = sizeof(*addr6);
+
+    if (inet_pton(AF_INET6, upstream, &ipv6) == 1) {
+        addr6->sin6_addr = ipv6;
+        return 0;
+    }
+
+    if (inet_pton(AF_INET, upstream, &ipv4) == 1) {
+        memset(&addr6->sin6_addr, 0, sizeof(addr6->sin6_addr));
+        addr6->sin6_addr.s6_addr[10] = 0xff;
+        addr6->sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&addr6->sin6_addr.s6_addr[12], &ipv4, sizeof(ipv4));
+        return 0;
+    }
+
+    return -1;
+}
+
+// relay_is_from_upstream 用于区分主socket收到的是客户端查询还是上游响应。
+int relay_is_from_upstream(const struct sockaddr *addr) {
+    struct sockaddr_storage upstream_addr;
+    socklen_t upstream_len;
+    if (addr == NULL) {
+        return 0;
+    }
+    if (relay_get_upstream_addr(&upstream_addr, &upstream_len) != 0) {
+        return 0;
+    }
+    return sockaddr_endpoint_equal(addr, (struct sockaddr *)&upstream_addr);
 }
 
 // 复用主socket转发：修改DNS ID，记录映射，然后直接sendto上游DNS。
 int relay_forward_query(socket_t sock,
                         uint8_t *query_buf,
                         int query_len,
-                        const struct sockaddr_in *client_addr,
+                        const struct sockaddr *client_addr,
                         socklen_t client_len,
                         const char *domain,
                         uint16_t qtype,
                         uint16_t qclass) {
-    struct sockaddr_in upstream_addr;
+    struct sockaddr_storage upstream_addr;
+    socklen_t upstream_len;
     uint16_t client_id;
     uint16_t upstream_id;
     int n;
@@ -55,17 +159,26 @@ int relay_forward_query(socket_t sock,
     client_id = dns_get_id(query_buf, query_len);
 
     // 将客户端相关信息作为新的条目加入ID映射表（upstream_id段暂时留空），并检查
-    if (idmap_add(client_id, client_addr, client_len, domain, qtype, qclass, &upstream_id) != 0) {
+    if (idmap_add(client_id, client_addr, client_len, query_buf, query_len, domain, qtype, qclass, &upstream_id) != 0) {
         log_warn("add id map failed domain=%s", domain == NULL ? "" : domain);
+        relay_send_servfail(sock, query_buf, query_len, client_addr, client_len, domain);
         return -1;
     }
 
     dns_set_id(query_buf, query_len, upstream_id);
-    relay_get_upstream_addr(&upstream_addr);
+    if (relay_get_upstream_addr(&upstream_addr, &upstream_len) != 0) {
+        dns_set_id(query_buf, query_len, client_id);
+        relay_send_servfail(sock, query_buf, query_len, client_addr, client_len, domain);
+        idmap_remove(upstream_id);
+        log_warn("invalid upstream DNS address domain=%s", domain == NULL ? "" : domain);
+        return -1;
+    }
     // 将 客户端的查询报 转发给 上游DNS服务器
     n = (int)sendto(sock, (const char *)query_buf, query_len, 0,
-                   (struct sockaddr *)&upstream_addr, sizeof(upstream_addr));
+                   (struct sockaddr *)&upstream_addr, upstream_len);
     if (n != query_len) {
+        dns_set_id(query_buf, query_len, client_id);
+        relay_send_servfail(sock, query_buf, query_len, client_addr, client_len, domain);
         idmap_remove(upstream_id);
         log_warn("send query to upstream failed domain=%s", domain == NULL ? "" : domain);
         return -1;
@@ -83,10 +196,11 @@ int relay_forward_query(socket_t sock,
 int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int response_len) {
     uint16_t upstream_id;
     uint16_t client_id;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     socklen_t client_len;
     char domain[256];
     uint32_t cache_ip;
+    uint8_t cache_ipv6[16];
     uint32_t ttl_sec;
     uint16_t qtype;
     uint16_t qclass;
@@ -106,9 +220,12 @@ int relay_handle_upstream_response(socket_t sock, uint8_t *response_buf, int res
         idmap_remove(upstream_id);
         return -1;
     }
-    if (qtype == 1 && qclass == 1 &&
+    if (qtype == DNS_TYPE_A && qclass == DNS_CLASS_IN &&
         dns_extract_first_a_record_for_domain(response_buf, response_len, domain, &cache_ip, &ttl_sec)) {
         cache_store(domain, cache_ip, ttl_sec);
+    } else if (qtype == DNS_TYPE_AAAA && qclass == DNS_CLASS_IN &&
+               dns_extract_first_aaaa_record_for_domain(response_buf, response_len, domain, cache_ipv6, &ttl_sec)) {
+        cache_store_aaaa(domain, cache_ipv6, ttl_sec);
     }
     // 将上游DNS服务器响应的id设置为客户端请求的旧id
     dns_set_id(response_buf, response_len, client_id);

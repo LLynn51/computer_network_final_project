@@ -2,18 +2,12 @@
 #include "table.h"
 
 #include "logger.h"
+#include "netutil.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
 
 // 本地域名表单行最大长度。
 #define TABLE_LINE_LEN 512
@@ -22,8 +16,10 @@
 typedef struct TableNode {
     // 小写规范化后的域名。
     char domain[256];
-    // 主机字节序IPv4地址；0表示拦截域名。
-    uint32_t ip;
+    // AF_INET 或 AF_INET6。
+    int family;
+    // IPv4 使用前4字节，IPv6 使用16字节；全0地址表示拦截域名。
+    uint8_t addr[16];
     // 指向下一个表项。
     struct TableNode *next;
 } TableNode;
@@ -51,27 +47,38 @@ static void to_lower_ascii(char *s) {
     }
 }
 
-// parse_ip 将IPv4字面量解析成主机字节序整数，成功返回1。
-static int parse_ip(const char *s, uint32_t *ip) {
-    unsigned long addr;
-    if (s == NULL || ip == NULL) {
+// parse_ip 将IPv4/IPv6字面量解析成网络字节序地址，成功返回1。
+static int parse_ip(const char *s, int *family, uint8_t addr[16]) {
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+
+    if (s == NULL || family == NULL || addr == NULL) {
         return 0;
     }
-    // 使用 inet_addr 读取 IPv4 地址。若读入的字符串是域名而不是 IPv4 地址，返回0。
-    addr = inet_addr(s);
-    if (addr == INADDR_NONE && strcmp(s, "255.255.255.255") != 0) {
-        return 0; // INADDR_NONE 非法地址格式 并且 排除稀有的全 1 域名
+
+    if (inet_pton(AF_INET, s, &ipv4) == 1) {
+        memset(addr, 0, 16);
+        memcpy(addr, &ipv4, sizeof(ipv4));
+        *family = AF_INET;
+        return 1;
     }
-    *ip = ntohl((uint32_t)addr);
-    return 1;
+
+    if (inet_pton(AF_INET6, s, &ipv6) == 1) {
+        memcpy(addr, &ipv6, sizeof(ipv6));
+        *family = AF_INET6;
+        return 1;
+    }
+
+    return 0;
 }
 
 // add_entry 将从本地表（磁盘）中读出的域名和ip信息填入 TableNode 链表（内存），便于处理
-static int add_entry(const char *domain, uint32_t ip) {
+static int add_entry(const char *domain, int family, const uint8_t addr[16]) {
     // 创建新节点
     TableNode *node;
     // 检查传入信息（空域名）
-    if (domain == NULL || domain[0] == '\0') {
+    if (domain == NULL || domain[0] == '\0' || addr == NULL ||
+        (family != AF_INET && family != AF_INET6)) {
         return -1;
     }
     // 分配空间并检查
@@ -83,7 +90,8 @@ static int add_entry(const char *domain, uint32_t ip) {
     strncpy(node->domain, domain, sizeof(node->domain) - 1); // 复制域名
     node->domain[sizeof(node->domain) - 1] = '\0'; // 添结束符
     to_lower_ascii(node->domain); // 大小写转换 到此域名复制工作完成
-    node->ip = ip; // 复制ip
+    node->family = family;
+    memcpy(node->addr, addr, sizeof(node->addr)); // 复制ip
     node->next = g_table; 
     g_table = node; // 头插法创建新节点
     // 成功读入内存则返回0
@@ -120,7 +128,8 @@ int load_table(const char *filename) {
     while (fgets(line, sizeof(line), fp) != NULL) {
         char first[256];
         char second[256];// 本项目中，本地表支持"域名 ip"和"ip 域名"两种格式
-        uint32_t ip;
+        int family;
+        uint8_t addr[16];
         const char *domain = NULL; // 临时存放数据
         // 去除换行符
         trim_newline(line);
@@ -133,16 +142,16 @@ int load_table(const char *filename) {
             continue;
         }
         // 分别尝试在两种格式下解析域名，并检查
-        if (parse_ip(first, &ip)) {
+        if (parse_ip(first, &family, addr)) {
             domain = second;
-        } else if (parse_ip(second, &ip)) {
+        } else if (parse_ip(second, &family, addr)) {
             domain = first;
         } else {
             log_warn("skip invalid table line: %s", line);
             continue;
         }
         // 如果成功读入内存，增加计数器
-        if (add_entry(domain, ip) == 0) {
+        if (add_entry(domain, family, addr) == 0) {
             count++;
         }
     }
@@ -153,11 +162,12 @@ int load_table(const char *filename) {
     // 返回读入数据条数
     return count;
 }
-// table_lookup 在本地表中查询domain对应ip
+// table_lookup_a 在本地表中查询domain对应IPv4地址
 // 参数 domain 要查询的（客户端提供）域名 ip 一般为本机ip
-int table_lookup(const char *domain, uint32_t *ip) {
+int table_lookup_a(const char *domain, uint32_t *ip) {
     char key[256];
     TableNode *node;
+    uint32_t network_ip;
     // 查询的信息本身为空，返回不存在
     if (domain == NULL || ip == NULL) {
         return 0;
@@ -169,11 +179,40 @@ int table_lookup(const char *domain, uint32_t *ip) {
     // 从本地表头指针开始在本地表中查询，命中则返回1。
     // 是否拦截由返回值和*ip共同判断：返回0表示未找到；返回1且*ip为0表示命中拦截规则。
     for (node = g_table; node != NULL; node = node->next) {
-        if (strcmp(node->domain, key) == 0) {
-            *ip = node->ip; // 如果 *ip==0 ，说明是被拦截的域名；否则是正常返回的域名
+        if (node->family == AF_INET && strcmp(node->domain, key) == 0) {
+            memcpy(&network_ip, node->addr, sizeof(network_ip));
+            *ip = ntohl(network_ip); // 如果 *ip==0 ，说明是被拦截的域名；否则是正常返回的域名
             return 1;
         }
     }
 
     return 0;
+}
+
+// table_lookup_aaaa 在本地表中查询domain对应IPv6地址。
+int table_lookup_aaaa(const char *domain, uint8_t ipv6[16]) {
+    char key[256];
+    TableNode *node;
+
+    if (domain == NULL || ipv6 == NULL) {
+        return 0;
+    }
+
+    strncpy(key, domain, sizeof(key) - 1);
+    key[sizeof(key) - 1] = '\0';
+    to_lower_ascii(key);
+
+    for (node = g_table; node != NULL; node = node->next) {
+        if (node->family == AF_INET6 && strcmp(node->domain, key) == 0) {
+            memcpy(ipv6, node->addr, 16);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// table_lookup 兼容旧接口，等价于查询A记录。
+int table_lookup(const char *domain, uint32_t *ip) {
+    return table_lookup_a(domain, ip);
 }
