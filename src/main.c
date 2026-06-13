@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // 由于UDP协议不可信，因此每次每次调用协议解析器都需要检查边界
 // Main 程序入口：启动DNS Relay服务端，接收客户端查询并处理本地命中、缓存命中或上游转发。
@@ -36,8 +37,8 @@ int main(int argc, char **argv) {
     cache_init();
     load_table(config->table_file);
 
-    // ubp_bind_socket()：将 socket 绑定到命令行输入指定的端口
-    // 在 udp_bind_socket.c中实现
+    // udp_bind_socket()：将 socket 绑定到指定的端口
+    // 在 udp_bind_socket中实现
     // 全程（整个项目）只使用一个sock！
     sock = udp_bind_socket(config->listen_port);
     if (sock == SOCKET_INVALID) {
@@ -51,13 +52,14 @@ int main(int argc, char **argv) {
 
 
     for (;;) {
-        struct sockaddr_in src_addr;
+        struct sockaddr_storage src_addr;
         socklen_t src_len = sizeof(src_addr);
         int n;
         int ready;
         DNSQuery query;
         char src_ip[64];
         uint32_t local_ip;
+        uint8_t local_ipv6[16];
         int response_len;
 
 
@@ -78,23 +80,23 @@ int main(int argc, char **argv) {
                 // 现在buf内已是DNS协议二进制数据
 
                 // 处理来自上游DNS服务器的响应
-                if (relay_is_from_upstream(&src_addr) && dns_is_response(buf, n)) {
+                if (relay_is_from_upstream((struct sockaddr *)&src_addr) && dns_is_response(buf, n)) {
                     relay_handle_upstream_response(sock, buf, n);
                 } else if (dns_parse_query(buf, n, &query) != 0) {
                     // dns_parse_query()：进行DNS协议解析
                     // 在dns.c中实现
                     // 输入buf[]中的原始二进制协议，输出结构化的结果（含有id、domain和qtype等信息）
                     log_warn("invalid dns packet from %s:%u len=%d",
-                             sockaddr_to_string(&src_addr, src_ip, sizeof(src_ip)),
-                             ntohs(src_addr.sin_port), n);
+                             sockaddr_to_string((struct sockaddr *)&src_addr, src_ip, sizeof(src_ip)),
+                             sockaddr_port((struct sockaddr *)&src_addr), n);
                 } else {
                     // 服务器接收到客户端请求时打印调试信息
                     log_info("query client=%s:%u id=%u domain=%s qtype=%u qclass=%u",
-                             sockaddr_to_string(&src_addr, src_ip, sizeof(src_ip)),
-                             ntohs(src_addr.sin_port), query.id, query.domain, query.qtype, query.qclass);
+                             sockaddr_to_string((struct sockaddr *)&src_addr, src_ip, sizeof(src_ip)),
+                             sockaddr_port((struct sockaddr *)&src_addr), query.id, query.domain, query.qtype, query.qclass);
 
                     // 本地表命中时，直接构造固定IP响应
-                    if (query.qtype == 1 && query.qclass == 1 && table_lookup(query.domain, &local_ip)) {
+                    if (query.qtype == DNS_TYPE_A && query.qclass == DNS_CLASS_IN && table_lookup_a(query.domain, &local_ip)) {
                         if (local_ip == 0) { // 如果 *ip==0 ，说明是被拦截的域名；
                             response_len = dns_build_nxdomain_response(buf, n, response, sizeof(response));
                             log_info("local block domain=%s", query.domain);
@@ -111,7 +113,22 @@ int main(int argc, char **argv) {
                         } else {
                             log_warn("build local response failed domain=%s", query.domain);
                         }
-                    } else if (query.qtype == 1 && query.qclass == 1 && cache_lookup(query.domain, &local_ip)) {
+                    } else if (query.qtype == DNS_TYPE_AAAA && query.qclass == DNS_CLASS_IN && table_lookup_aaaa(query.domain, local_ipv6)) {
+                        if (memcmp(local_ipv6, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0) {
+                            response_len = dns_build_nxdomain_response(buf, n, response, sizeof(response));
+                            log_info("local block domain=%s", query.domain);
+                        } else {
+                            response_len = dns_build_aaaa_response(buf, n, local_ipv6, response, sizeof(response));
+                            log_info("local hit domain=%s", query.domain);
+                        }
+
+                        if (response_len > 0) {
+                            sendto(sock, (const char *)response, response_len, 0,
+                                   (struct sockaddr *)&src_addr, src_len);
+                        } else {
+                            log_warn("build local AAAA response failed domain=%s", query.domain);
+                        }
+                    } else if (query.qtype == DNS_TYPE_A && query.qclass == DNS_CLASS_IN && cache_lookup(query.domain, &local_ip)) {
                         response_len = dns_build_a_response(buf, n, local_ip, response, sizeof(response));
                         if (response_len > 0) {
                             sendto(sock, (const char *)response, response_len, 0,
@@ -119,7 +136,25 @@ int main(int argc, char **argv) {
                         } else {
                             log_warn("build cache response failed domain=%s", query.domain);
                         }
-                    } else if (relay_forward_query(sock, buf, n, &src_addr, src_len, query.domain, query.qtype, query.qclass) != 0) {
+                    } else if (query.qtype == DNS_TYPE_AAAA && query.qclass == DNS_CLASS_IN && cache_lookup_aaaa(query.domain, local_ipv6)) {
+                        response_len = dns_build_aaaa_response(buf, n, local_ipv6, response, sizeof(response));
+                        if (response_len > 0) {
+                            sendto(sock, (const char *)response, response_len, 0,
+                                   (struct sockaddr *)&src_addr, src_len);
+                        } else {
+                            log_warn("build cache AAAA response failed domain=%s", query.domain);
+                        }
+                    } else if (query.qtype == DNS_TYPE_PTR && query.qclass == DNS_CLASS_IN &&
+                               strcmp(query.domain, "1.0.0.127.in-addr.arpa") == 0) {
+                        response_len = dns_build_ptr_response(buf, n, "localhost", response, sizeof(response));
+                        if (response_len > 0) {
+                            sendto(sock, (const char *)response, response_len, 0,
+                                   (struct sockaddr *)&src_addr, src_len);
+                            log_info("local PTR domain=%s ptr=localhost", query.domain);
+                        } else {
+                            log_warn("build PTR response failed domain=%s", query.domain);
+                        }
+                    } else if (relay_forward_query(sock, buf, n, (struct sockaddr *)&src_addr, src_len, query.domain, query.qtype, query.qclass) != 0) {
                         // 本地未命中时，复用主socket转发给上游DNS；响应会在后续recvfrom中收到
                         log_warn("forward failed domain=%s", query.domain);
                     }
@@ -127,7 +162,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        idmap_cleanup_timeout(net_now_ms(), (uint64_t)config->idmap_timeout_ms);
+        idmap_cleanup_timeout(sock, net_now_ms(), (uint64_t)config->idmap_timeout_ms);
         cache_cleanup_expired(net_now_ms());
     }
 

@@ -2,10 +2,18 @@
 #define NETUTIL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef __MINGW32__
+int WSAAPI inet_pton(int family, const char *src, void *dst);
+const char *WSAAPI inet_ntop(int family, const void *src, char *dst, size_t size);
+#endif
 // Windows 下 socket 句柄类型。
 typedef SOCKET socket_t;
 // 跨平台 socket 无效值。
@@ -13,6 +21,8 @@ typedef SOCKET socket_t;
 // 跨平台 socket 关闭函数。
 #define socket_close closesocket
 #else
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -33,8 +43,11 @@ void net_cleanup(void);
 // 创建 UDP socket 并绑定到指定本地端口。
 socket_t udp_bind_socket(uint16_t port);
 
-// 将 IPv4 socket 地址转换为点分十进制字符串。
-const char *sockaddr_to_string(const struct sockaddr_in *addr, char *buf, int buflen);
+// 将 IPv4/IPv6 socket 地址转换为日志可读字符串。
+const char *sockaddr_to_string(const struct sockaddr *addr, char *buf, int buflen);
+
+// 从 IPv4/IPv6 socket 地址中取出主机字节序端口号。
+uint16_t sockaddr_port(const struct sockaddr *addr);
 
 // 使用 select() 等待 socket 可读；返回 1 可读、0 超时、-1 失败。
 int net_wait_readable(socket_t sock, int timeout_ms);

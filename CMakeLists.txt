@@ -26,12 +26,7 @@ add_executable(Main
         ${SERVER_SOURCES}
 )
 
-add_executable(Client
-        src/client.c
-        ${COMMON_SOURCES}
-)
 
 if (WIN32)
     target_link_libraries(Main ws2_32)
-    target_link_libraries(Client ws2_32)
 endif()

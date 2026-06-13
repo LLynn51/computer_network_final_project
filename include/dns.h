@@ -12,6 +12,15 @@
 // 域名字符串最大长度，包含结尾 '\0' 的缓冲区空间。
 #define DNS_MAX_DOMAIN_LEN 256
 
+#define DNS_RCODE_NOERROR 0
+#define DNS_RCODE_SERVFAIL 2
+#define DNS_RCODE_NXDOMAIN 3
+
+#define DNS_TYPE_A 1
+#define DNS_TYPE_PTR 12
+#define DNS_TYPE_AAAA 28
+#define DNS_CLASS_IN 1
+
 typedef struct {
     // DNS 报文 ID，用于匹配请求和响应。
     uint16_t id;
@@ -26,7 +35,7 @@ typedef struct {
 typedef struct {
     // DNS 响应 ID。
     uint16_t id;
-    // 响应码，0 表示成功，3 表示 NXDOMAIN。
+    // 响应码，0 表示成功，2 表示 SERVFAIL，3 表示 NXDOMAIN。
     uint16_t rcode;
     // Answer 区资源记录数量。
     uint16_t answer_count;
@@ -50,8 +59,17 @@ int dns_parse_response(const uint8_t *buf, int len, DNSResponse *response);
 // 基于原始查询报文构造本地 A 记录响应，返回响应长度。
 int dns_build_a_response(const uint8_t *query_buf, int query_len, uint32_t ip, uint8_t *outbuf, int outsize);
 
+// 基于原始查询报文构造本地 AAAA 记录响应，返回响应长度。
+int dns_build_aaaa_response(const uint8_t *query_buf, int query_len, const uint8_t ipv6[16], uint8_t *outbuf, int outsize);
+
 // 基于原始查询报文构造 NXDOMAIN 响应，通常用于本地拦截。
 int dns_build_nxdomain_response(const uint8_t *query_buf, int query_len, uint8_t *outbuf, int outsize);
+
+// 基于原始查询报文构造错误响应，例如 SERVFAIL(rcode=2)。
+int dns_build_error_response(const uint8_t *query_buf, int query_len, uint16_t rcode, uint8_t *outbuf, int outsize);
+
+// 基于原始 PTR 查询构造 PTR 响应，ptr_domain 为点分形式目标域名。
+int dns_build_ptr_response(const uint8_t *query_buf, int query_len, const char *ptr_domain, uint8_t *outbuf, int outsize);
 
 // 从 DNS 报文头部读取 ID；报文不足 2 字节时返回 0。
 uint16_t dns_get_id(const uint8_t *buf, int len);
@@ -67,6 +85,9 @@ int dns_extract_first_a_record(const uint8_t *buf, int len, uint32_t *ip, uint32
 
 // 从响应 Answer 区提取指定域名对应的第一个 A 记录。
 int dns_extract_first_a_record_for_domain(const uint8_t *buf, int len, const char *domain, uint32_t *ip, uint32_t *ttl_sec);
+
+// 从响应 Answer 区提取指定域名对应的第一个 AAAA 记录。
+int dns_extract_first_aaaa_record_for_domain(const uint8_t *buf, int len, const char *domain, uint8_t ipv6[16], uint32_t *ttl_sec);
 
 // 校验上游响应中的 Question 是否与转发前记录的域名、类型和类别一致。
 int dns_response_matches_question(const uint8_t *buf, int len, const char *domain, uint16_t qtype, uint16_t qclass);

@@ -37,46 +37,73 @@ void net_cleanup(void) {
 // 返回值 socket_fd：成功 -1：失败
 socket_t udp_bind_socket(uint16_t port) {
     socket_t sock;
-    struct sockaddr_in addr;
+    struct sockaddr_in6 addr;
     int reuse = 1;
-    // 创建IPv4 UDP UDP协议 socket
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int v6only = 0;
+    // 创建 IPv6 UDP socket，并尽量开启 dual-stack 兼容 IPv4-mapped 地址。
+    sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == SOCKET_INVALID) {
         log_error("socket creation failed");
         return SOCKET_INVALID;
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
 
     // 清空addr结构
     memset(&addr, 0, sizeof(addr));
-    // 配置IPv4地址结构
-    addr.sin_family = AF_INET; // 地址族为IPv4
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // 监听所有端口
-    addr.sin_port = htons(port); // 将主机字节序转化为网络字节序
+    // 配置IPv6地址结构，监听所有本地地址。
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port); // 将主机字节序转化为网络字节序
     // 尝试bind端口。常见失败原因有端口已被占用/权限不足
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         log_error("bind failed on UDP port %u", port);
-        #ifdef _WIN32
-        closesocket(sock);
-        #else
-        close(sock);
-        #endif
+        socket_close(sock);
         return SOCKET_INVALID;
     }
 
     return sock;
 }
 
-// sockaddr_to_string 将IPv4地址部分转换成便于日志输出的字符串。
-const char *sockaddr_to_string(const struct sockaddr_in *addr, char *buf, int buflen) {
+// sockaddr_to_string 将IPv4/IPv6地址部分转换成便于日志输出的字符串。
+const char *sockaddr_to_string(const struct sockaddr *addr, char *buf, int buflen) {
+    const void *src = NULL;
+
     if (addr == NULL || buf == NULL || buflen <= 0) {
         return "";
     }
 
-    snprintf(buf, (size_t)buflen, "%s", inet_ntoa(addr->sin_addr));
+    if (addr->sa_family == AF_INET) {
+        src = &((const struct sockaddr_in *)addr)->sin_addr;
+    } else if (addr->sa_family == AF_INET6) {
+        src = &((const struct sockaddr_in6 *)addr)->sin6_addr;
+    } else {
+        snprintf(buf, (size_t)buflen, "unknown");
+        return buf;
+    }
+
+    if (inet_ntop(addr->sa_family, src, buf, (socklen_t)buflen) == NULL) {
+        snprintf(buf, (size_t)buflen, "unknown");
+    }
 
     return buf;
+}
+
+// sockaddr_port 从IPv4/IPv6地址结构中读取端口。
+uint16_t sockaddr_port(const struct sockaddr *addr) {
+    if (addr == NULL) {
+        return 0;
+    }
+
+    if (addr->sa_family == AF_INET) {
+        return ntohs(((const struct sockaddr_in *)addr)->sin_port);
+    }
+    if (addr->sa_family == AF_INET6) {
+        return ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
+    }
+
+    return 0;
 }
 
 // net_wait_readable 使用select等待socket可读。

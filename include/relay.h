@@ -5,17 +5,17 @@
 
 #include <stdint.h>
 
-// 根据当前配置生成上游 DNS 的 IPv4 socket 地址。
-void relay_get_upstream_addr(struct sockaddr_in *addr);
+// 根据当前配置生成上游 DNS 的 IPv4/IPv6 socket 地址。
+int relay_get_upstream_addr(struct sockaddr_storage *addr, socklen_t *addr_len);
 
 // 判断收到的 UDP 包是否来自配置中的上游 DNS。
-int relay_is_from_upstream(const struct sockaddr_in *addr);
+int relay_is_from_upstream(const struct sockaddr *addr);
 
 // 转发客户端查询到上游 DNS，并建立上游 ID 到客户端 ID 的映射。
 int relay_forward_query(socket_t sock,
                         uint8_t *query_buf,
                         int query_len,
-                        const struct sockaddr_in *client_addr,
+                        const struct sockaddr *client_addr,
                         socklen_t client_len,
                         const char *domain,
                         uint16_t qtype,
