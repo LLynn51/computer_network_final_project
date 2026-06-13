@@ -1,0 +1,15 @@
+实现计划.md
+AGENTS.md
+build/
+out/
+bin/
+lib/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+*.cbp
+*.exe
+.vscode/
+.docx
