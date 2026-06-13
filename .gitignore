@@ -12,4 +12,6 @@ Makefile
 *.cbp
 *.exe
 .vscode/
-.docx
+*.docx
+.idea/
+*.pdf

@@ -1,19 +1,14 @@
 // table 在本地表(dnsrelay.txt)中查找域名
 #include "table.h"
 
+#include "dns.h"
 #include "logger.h"
+#include "netutil.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
 
 // 本地域名表单行最大长度。
 #define TABLE_LINE_LEN 512
@@ -22,8 +17,12 @@
 typedef struct TableNode {
     // 小写规范化后的域名。
     char domain[256];
-    // 主机字节序IPv4地址；0表示拦截域名。
+    // 记录类型，支持 A 和 AAAA。
+    uint16_t qtype;
+    // 主机字节序IPv4地址；A记录中0表示拦截域名。
     uint32_t ip;
+    // 网络字节序IPv6地址；AAAA记录中全0表示拦截域名。
+    uint8_t ipv6[16];
     // 指向下一个表项。
     struct TableNode *next;
 } TableNode;
@@ -51,27 +50,38 @@ static void to_lower_ascii(char *s) {
     }
 }
 
-// parse_ip 将IPv4字面量解析成主机字节序整数，成功返回1。
-static int parse_ip(const char *s, uint32_t *ip) {
-    unsigned long addr;
-    if (s == NULL || ip == NULL) {
+// parse_ip_literal 将 IPv4/IPv6 字面量解析为内部地址格式，成功返回1。
+static int parse_ip_literal(const char *s, uint16_t *qtype, uint32_t *ip, uint8_t ipv6[16]) {
+    struct in_addr addr4;
+    struct in6_addr addr6;
+
+    if (s == NULL || qtype == NULL || ip == NULL || ipv6 == NULL) {
         return 0;
     }
-    // 使用 inet_addr 读取 IPv4 地址。若读入的字符串是域名而不是 IPv4 地址，返回0。
-    addr = inet_addr(s);
-    if (addr == INADDR_NONE && strcmp(s, "255.255.255.255") != 0) {
-        return 0; // INADDR_NONE 非法地址格式 并且 排除稀有的全 1 域名
+
+    if (inet_pton(AF_INET, s, &addr4) == 1) {
+        *qtype = DNS_TYPE_A;
+        *ip = ntohl(addr4.s_addr);
+        memset(ipv6, 0, 16);
+        return 1;
     }
-    *ip = ntohl((uint32_t)addr);
-    return 1;
+
+    if (inet_pton(AF_INET6, s, &addr6) == 1) {
+        *qtype = DNS_TYPE_AAAA;
+        *ip = 0;
+        memcpy(ipv6, &addr6, 16);
+        return 1;
+    }
+
+    return 0;
 }
 
 // add_entry 将从本地表（磁盘）中读出的域名和ip信息填入 TableNode 链表（内存），便于处理
-static int add_entry(const char *domain, uint32_t ip) {
+static int add_entry(const char *domain, uint16_t qtype, uint32_t ip, const uint8_t ipv6[16]) {
     // 创建新节点
     TableNode *node;
     // 检查传入信息（空域名）
-    if (domain == NULL || domain[0] == '\0') {
+    if (domain == NULL || domain[0] == '\0' || (qtype != DNS_TYPE_A && qtype != DNS_TYPE_AAAA)) {
         return -1;
     }
     // 分配空间并检查
@@ -83,7 +93,12 @@ static int add_entry(const char *domain, uint32_t ip) {
     strncpy(node->domain, domain, sizeof(node->domain) - 1); // 复制域名
     node->domain[sizeof(node->domain) - 1] = '\0'; // 添结束符
     to_lower_ascii(node->domain); // 大小写转换 到此域名复制工作完成
+    node->qtype = qtype;
     node->ip = ip; // 复制ip
+    memset(node->ipv6, 0, sizeof(node->ipv6));
+    if (qtype == DNS_TYPE_AAAA && ipv6 != NULL) {
+        memcpy(node->ipv6, ipv6, sizeof(node->ipv6));
+    }
     node->next = g_table; 
     g_table = node; // 头插法创建新节点
     // 成功读入内存则返回0
@@ -121,6 +136,8 @@ int load_table(const char *filename) {
         char first[256];
         char second[256];// 本项目中，本地表支持"域名 ip"和"ip 域名"两种格式
         uint32_t ip;
+        uint16_t qtype;
+        uint8_t ipv6[16];
         const char *domain = NULL; // 临时存放数据
         // 去除换行符
         trim_newline(line);
@@ -133,16 +150,16 @@ int load_table(const char *filename) {
             continue;
         }
         // 分别尝试在两种格式下解析域名，并检查
-        if (parse_ip(first, &ip)) {
+        if (parse_ip_literal(first, &qtype, &ip, ipv6)) {
             domain = second;
-        } else if (parse_ip(second, &ip)) {
+        } else if (parse_ip_literal(second, &qtype, &ip, ipv6)) {
             domain = first;
         } else {
             log_warn("skip invalid table line: %s", line);
             continue;
         }
         // 如果成功读入内存，增加计数器
-        if (add_entry(domain, ip) == 0) {
+        if (add_entry(domain, qtype, ip, ipv6) == 0) {
             count++;
         }
     }
@@ -153,27 +170,63 @@ int load_table(const char *filename) {
     // 返回读入数据条数
     return count;
 }
-// table_lookup 在本地表中查询domain对应ip
-// 参数 domain 要查询的（客户端提供）域名 ip 一般为本机ip
-int table_lookup(const char *domain, uint32_t *ip) {
+static int make_lookup_key(const char *domain, char *key, int key_size) {
+    if (domain == NULL || key == NULL || key_size <= 0) {
+        return -1;
+    }
+
+    strncpy(key, domain, (size_t)key_size - 1);
+    key[key_size - 1] = '\0';
+    to_lower_ascii(key);
+    return 0;
+}
+
+// table_lookup_a 在本地表中查询domain对应IPv4地址。
+int table_lookup_a(const char *domain, uint32_t *ip) {
     char key[256];
     TableNode *node;
     // 查询的信息本身为空，返回不存在
     if (domain == NULL || ip == NULL) {
         return 0;
     }
-    // 在 key 数组中存储规范化后的 domain
-    strncpy(key, domain, sizeof(key) - 1);
-    key[sizeof(key) - 1] = '\0';
-    to_lower_ascii(key);
+    if (make_lookup_key(domain, key, sizeof(key)) != 0) {
+        return 0;
+    }
     // 从本地表头指针开始在本地表中查询，命中则返回1。
     // 是否拦截由返回值和*ip共同判断：返回0表示未找到；返回1且*ip为0表示命中拦截规则。
     for (node = g_table; node != NULL; node = node->next) {
-        if (strcmp(node->domain, key) == 0) {
+        if (node->qtype == DNS_TYPE_A && strcmp(node->domain, key) == 0) {
             *ip = node->ip; // 如果 *ip==0 ，说明是被拦截的域名；否则是正常返回的域名
             return 1;
         }
     }
 
     return 0;
+}
+
+// table_lookup_aaaa 在本地表中查询domain对应IPv6地址。
+int table_lookup_aaaa(const char *domain, uint8_t ipv6[16]) {
+    char key[256];
+    TableNode *node;
+
+    if (domain == NULL || ipv6 == NULL) {
+        return 0;
+    }
+    if (make_lookup_key(domain, key, sizeof(key)) != 0) {
+        return 0;
+    }
+
+    for (node = g_table; node != NULL; node = node->next) {
+        if (node->qtype == DNS_TYPE_AAAA && strcmp(node->domain, key) == 0) {
+            memcpy(ipv6, node->ipv6, 16);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// table_lookup 兼容旧接口：查询 A 记录。
+int table_lookup(const char *domain, uint32_t *ip) {
+    return table_lookup_a(domain, ip);
 }
